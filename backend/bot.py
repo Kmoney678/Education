@@ -912,12 +912,12 @@ class DataEngine:
     ) -> tuple[bool, str]:
         """Re-checks the daily cap and cooldown AND records+pays the
         reward, all inside one BEGIN EXCLUSIVE transaction.
-        Rule: On even-numbered ad attempts (2, 4, 6, 8, 10...), show click reminder
-        and control reward (require click / withhold reward)."""
+        Rule: Alternating ad attempts.
+        - Odd attempts (1, 3, 5, 7...): No pay, show click reminder warning.
+        - Even attempts (2, 4, 6, 8...): Pay out reward."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN EXCLUSIVE")
             try:
-                # Count total ad events today (completed or warning)
                 cur_total = await db.execute(
                     "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind='video' "
                     "AND date(started_at)=date('now')",
@@ -925,8 +925,8 @@ class DataEngine:
                 )
                 attempt_num = (await cur_total.fetchone())[0] + 1  # 1, 2, 3, 4...
 
-                # On 2nd, 4th, 6th, 8th, 10th ad attempts, trigger the click reminder & reward control
-                if attempt_num in (2, 4, 6, 8, 10) or (attempt_num % 2 == 0 and attempt_num <= 10):
+                # Odd numbered attempts (1, 3, 5, 7...) trigger the click reminder & withhold reward
+                if attempt_num % 2 != 0:
                     await db.execute(
                         "INSERT INTO ad_events (user_id, kind, status, reward) "
                         "VALUES (?, 'video', 'warning', 0)",
