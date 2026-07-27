@@ -3343,11 +3343,18 @@ async def api_ads_status(body: ApiBase):
 
 @api_app.post("/api/ads/claim")
 async def api_ads_claim(body: ApiBase):
-    """Rewarded video — the AdsGram SDK promise on the frontend already
-    confirmed the ad played to completion before this is ever called, so
-    we only need to re-check the daily cap / cooldown server-side (the
-    SDK promise resolving is not, by itself, something to trust for
-    payouts — a compromised client could call this directly)."""
+    """Advisory pre-check ONLY — does not pay or record anything anymore.
+    The AdsGram SDK promise resolving client-side is not, by itself,
+    trustworthy for payouts (a compromised/scripted client could call
+    this endpoint directly without ever showing a real ad, and has no way
+    for us to independently confirm whether the user actually clicked
+    inside the ad — that only happens inside AdsGram's own iframe). Real
+    payment now happens exclusively via /api/ads/adsgram-reward below —
+    the server-to-server postback AdsGram's own servers send only after
+    THEY confirm (on their end, by whatever criteria they use — view
+    completion, click, or both) that the reward is genuinely earned. This
+    endpoint just answers "is it even worth showing the ad right now" so
+    the UI can disable the button at the daily cap / during cooldown."""
     user = await _authenticate(body)
     uid = user["user_id"]
 
@@ -3359,12 +3366,48 @@ async def api_ads_claim(body: ApiBase):
 
     daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
     cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
+
+    watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
+    if watched_today >= daily_limit:
+        raise HTTPException(status_code=400, detail="daily_limit_reached")
+    last_at = await DataEngine.get_last_ad_event(uid, AD_KIND_VIDEO)
+    if last_at:
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(last_at, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            if elapsed < cooldown_seconds:
+                raise HTTPException(status_code=400, detail="cooldown_active")
+        except HTTPException:
+            raise
+        except Exception:
+            pass
+    return {"ok": True}
+
+
+@api_app.get("/api/ads/adsgram-reward")
+async def api_ads_adsgram_reward(userid: int):
+    """AdsGram server-to-server reward postback. Set this as the 'Reward
+    URL' on the video ad block in the AdsGram publisher dashboard
+    (partner.adsgram.ai) using AdsGram's own [userId] macro:
+        https://<this-backend-domain>/api/ads/adsgram-reward?userid=[userId]
+    AdsGram calls this from their own servers ONLY after confirming
+    server-side that the reward was genuinely earned (whatever their
+    criteria — this is the one place that criteria can actually be
+    enforced, since it happens inside AdsGram's own ad unit, completely
+    outside anything our own frontend or backend can observe directly).
+    /api/ads/claim above never pays anymore, so calling our own endpoints
+    directly with no real ad shown earns nothing. Same atomic daily-cap/
+    cooldown guard as everywhere else, so this can't be replayed for
+    repeat payouts either."""
+    user = await DataEngine.get_user(userid)
+    if not user or user["is_banned"]:
+        return {"ok": False}
+
+    daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+    cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
     reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
 
-    ok, reason = await DataEngine.claim_video_ad_atomic(uid, reward_amount, daily_limit, cooldown_seconds)
-    if not ok:
-        raise HTTPException(status_code=400, detail=reason)
-    return {"credited": reward_amount}
+    ok, _ = await DataEngine.claim_video_ad_atomic(userid, reward_amount, daily_limit, cooldown_seconds)
+    return {"ok": ok}
 
 
 @api_app.post("/api/ads/direct-link/open")
