@@ -911,9 +911,13 @@ class DataEngine:
         user_id: int, reward: float, daily_limit: int, cooldown_seconds: int
     ) -> tuple[bool, str]:
         """Re-checks the daily cap and cooldown AND records+pays the
-        reward, all inside one BEGIN EXCLUSIVE transaction. Requires that
-        the user has a recorded 'clicked' event today (ensuring they actually
-        clicked the ad banner/CTA before receiving the reward)."""
+        reward, all inside one BEGIN EXCLUSIVE transaction (same pattern
+        as create_withdrawal_atomic). There's no single row to guard here
+        the way task/direct-link claims can (this is a per-day COUNT, not
+        a status flip on one row), so several /api/ads/claim requests
+        fired at once could otherwise all read the same "watched_today"
+        value before any of them commits, letting the daily cap be
+        bypassed entirely. The exclusive lock serializes that."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN EXCLUSIVE")
             try:
@@ -942,24 +946,10 @@ class DataEngine:
                     except Exception:
                         pass
 
-                # Verify that a click event was recorded today for this user
-                cur_click = await db.execute(
-                    "SELECT id FROM ad_events WHERE user_id=? AND kind='video' "
-                    "AND status='clicked' AND date(started_at)=date('now') "
-                    "ORDER BY started_at DESC LIMIT 1",
-                    (user_id,),
-                )
-                click_row = await cur_click.fetchone()
-                if not click_row:
-                    await db.execute("ROLLBACK")
-                    return False, "ad_not_clicked"
-
-                event_id = click_row[0]
-
                 await db.execute(
-                    "UPDATE ad_events SET status='completed', reward=?, completed_at=datetime('now') "
-                    "WHERE id=? AND status='clicked'",
-                    (reward, event_id),
+                    "INSERT INTO ad_events (user_id, kind, status, reward, completed_at) "
+                    "VALUES (?, 'video', 'completed', ?, datetime('now'))",
+                    (user_id, reward),
                 )
                 await db.execute(
                     "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
