@@ -713,12 +713,11 @@ async function watchAd(){
   const watchedBefore = ADS?.watched_today ?? 0;
 
   try {
-    // /api/ads/claim is advisory-only now — it just re-confirms we're
-    // still under the daily cap / past cooldown before bothering to show
-    // an ad at all. It no longer moves any money.
+    // /api/ads/claim checks if this attempt triggers the click reminder & reward control (2, 4, 6, 8, 10...)
     await api("/api/ads/claim", {});
   } catch (claimErr) {
-    const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
+    const msg = claimErr?.message === "ad_click_reminder"      ? "⚠️ ማስታወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስታወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
+              : claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
               : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
               : "❌ Couldn't start — try again";
     toast(msg);
