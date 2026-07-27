@@ -3357,9 +3357,8 @@ async def api_ads_status(body: ApiBase):
 
 @api_app.post("/api/ads/claim")
 async def api_ads_claim(body: ApiBase):
-    """Checks daily cap, cooldown, and enforces the even-numbered ad attempts
-    (2, 4, 6, 8, 10...) click reminder & reward control rule right when
-    the user taps 'Watch Ad'."""
+    """Advisory pre-check — allows showing the ad, while reward payout
+    is controlled atomically in claim_video_ad_atomic."""
     user = await _authenticate(body)
     uid = user["user_id"]
 
@@ -3371,25 +3370,6 @@ async def api_ads_claim(body: ApiBase):
 
     daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
     cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
-
-    # Check attempt number for even-numbered ad attempts (2, 4, 6, 8, 10...)
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute(
-            "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind='video' "
-            "AND date(started_at)=date('now')",
-            (uid,),
-        ) as cur_total:
-            row = await cur_total.fetchone()
-            attempt_num = (row[0] if row else 0) + 1
-
-        if attempt_num in (2, 4, 6, 8, 10) or (attempt_num % 2 == 0 and attempt_num <= 10):
-            await db.execute(
-                "INSERT INTO ad_events (user_id, kind, status, reward) "
-                "VALUES (?, 'video', 'warning', 0)",
-                (uid,),
-            )
-            await db.commit()
-            raise HTTPException(status_code=400, detail="ad_click_reminder")
 
     watched_today = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
     if watched_today >= daily_limit:
