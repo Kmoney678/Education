@@ -591,6 +591,7 @@ function adsCardHTML(){
       <button class="btn" id="watchAdBtn" onclick="watchAd()" ${(!ADS.enabled || capped) ? "disabled" : ""}>
         ${capped ? "✅ Daily Limit Reached" : "▶️ Watch Ad"}
       </button>
+      ${capped ? "" : `<div class="mini" style="margin-top:8px;text-align:center;opacity:.85">⚠️ You must click on the ad while watching to receive your reward</div>`}
     `;
   })() : "";
 
@@ -706,6 +707,25 @@ async function watchAd(){
   api("/api/ads/click", { kind: "video" }).catch(() => {}); // analytics-only, never blocks
   if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
 
+  // Baseline, so we can detect the moment AdsGram's server-to-server
+  // postback actually lands (see the polling loop below) rather than
+  // trusting the client SDK's promise for anything financial.
+  const watchedBefore = ADS?.watched_today ?? 0;
+
+  try {
+    // /api/ads/claim is advisory-only now — it just re-confirms we're
+    // still under the daily cap / past cooldown before bothering to show
+    // an ad at all. It no longer moves any money.
+    await api("/api/ads/claim", {});
+  } catch (claimErr) {
+    const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
+              : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
+              : "❌ Couldn't start — try again";
+    toast(msg);
+    if (btn){ btn.disabled = false; btn.textContent = "▶️ Watch Ad"; }
+    return;
+  }
+
   let watched = false;
 
   if (ADS?.block_id && window.Adsgram){
@@ -751,19 +771,35 @@ async function watchAd(){
     return;
   }
 
-  try {
-    // Ad watched to completion (on whichever network) — ask OUR backend to
-    // credit it. The backend re-checks the daily cap and cooldown itself,
-    // so this call is the only thing that can actually move money, not
-    // either ad SDK's promise.
-    const res = await api("/api/ads/claim", {});
+  // The SDK promise resolving only means the PLAYER finished — it is not
+  // proof AdsGram itself will credit this view (their own criteria, which
+  // may include requiring a click inside the ad, is enforced entirely on
+  // their side). The real confirmation is their server-to-server reward
+  // postback landing on our backend, which shows up here as watched_today
+  // ticking up. Poll briefly for it rather than declaring success the
+  // instant the video ends.
+  toast("⏳ Confirming your reward…", "loading", { sticky: true });
+  let confirmed = false;
+  for (let i = 0; i < 6; i++){
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const fresh = await api("/api/ads/status", {});
+      ADS = fresh;
+      if ((fresh.watched_today ?? 0) > watchedBefore){
+        confirmed = true;
+        break;
+      }
+    } catch (e) { /* keep polling */ }
+  }
+
+  if (confirmed){
     tg?.HapticFeedback?.notificationOccurred("success");
-    toast(`✅ +${fmt(res.credited)} Birr credited`);
-  } catch (claimErr) {
-    const msg = claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
-              : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
-              : "❌ Couldn't credit the reward — try again";
-    toast(msg);
+    toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
+  } else {
+    // Not necessarily a failure — AdsGram's postback can occasionally lag
+    // a few seconds longer than this poll window, or (if no click
+    // happened and their criteria requires one) may never arrive at all.
+    toast("⏳ Still confirming — check your balance in a moment");
   }
   await renderHome(document.getElementById("view"));
 }
