@@ -787,10 +787,7 @@ async function watchAd(){
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
   } else {
-    // Not necessarily a failure — AdsGram's postback can occasionally lag
-    // a few seconds longer than this poll window, or (if no click
-    // happened and their criteria requires one) may never arrive at all.
-    toast("⏳ Still confirming — check your balance in a moment");
+    toast("⚠️ ማስታወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስታወቂያው ላይ ክሊክ ማድረግ አለብዎት።");
   }
   await renderHome(document.getElementById("view"));
 }
