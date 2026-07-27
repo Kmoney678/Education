@@ -911,16 +911,30 @@ class DataEngine:
         user_id: int, reward: float, daily_limit: int, cooldown_seconds: int
     ) -> tuple[bool, str]:
         """Re-checks the daily cap and cooldown AND records+pays the
-        reward, all inside one BEGIN EXCLUSIVE transaction (same pattern
-        as create_withdrawal_atomic). There's no single row to guard here
-        the way task/direct-link claims can (this is a per-day COUNT, not
-        a status flip on one row), so several /api/ads/claim requests
-        fired at once could otherwise all read the same "watched_today"
-        value before any of them commits, letting the daily cap be
-        bypassed entirely. The exclusive lock serializes that."""
+        reward, all inside one BEGIN EXCLUSIVE transaction.
+        Rule: On even-numbered ad attempts (2, 4, 6, 8, 10...), show click reminder
+        and control reward (require click / withhold reward)."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN EXCLUSIVE")
             try:
+                # Count total ad events today (completed or warning)
+                cur_total = await db.execute(
+                    "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind='video' "
+                    "AND date(started_at)=date('now')",
+                    (user_id,),
+                )
+                attempt_num = (await cur_total.fetchone())[0] + 1  # 1, 2, 3, 4...
+
+                # On 2nd, 4th, 6th, 8th, 10th ad attempts, trigger the click reminder & reward control
+                if attempt_num in (2, 4, 6, 8, 10) or (attempt_num % 2 == 0 and attempt_num <= 10):
+                    await db.execute(
+                        "INSERT INTO ad_events (user_id, kind, status, reward) "
+                        "VALUES (?, 'video', 'warning', 0)",
+                        (user_id,),
+                    )
+                    await db.execute("COMMIT")
+                    return False, "ad_click_reminder"
+
                 cur = await db.execute(
                     "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND kind='video' "
                     "AND status='completed' AND date(completed_at)=date('now')",
