@@ -727,6 +727,7 @@ async function watchAd(){
   }
 
   let watched = false;
+  let adClicked = false;
 
   if (ADS?.block_id && window.Adsgram){
     if (!adController){
@@ -740,6 +741,11 @@ async function watchAd(){
       adController.addEventListener("onNonStopShow",    noAdsMsg);
       adController.addEventListener("onTooLongSession",  noAdsMsg);
     }
+    const markClicked = () => { adClicked = true; };
+    adController.addEventListener("onBannerClick", markClicked);
+    adController.addEventListener("click", markClicked);
+    adController.addEventListener("bannerClick", markClicked);
+
     try {
       await adController.show();
       watched = true;
@@ -762,10 +768,18 @@ async function watchAd(){
     // AdsGram wasn't available/configured, or reported no fill — try
     // Monetag (if the admin has one configured) before giving up.
     watched = await tryMonetagFallback();
+    if (watched) adClicked = true;
   }
 
   if (!watched){
     toast("⌛ No ads available right now — please try again later");
+    if (btn){ btn.disabled = false; btn.textContent = "▶️ Watch Ad"; }
+    await renderHome(document.getElementById("view"));
+    return;
+  }
+
+  if (ADS?.block_id && !adClicked){
+    toast("⚠️ እባክዎ ማስታወቂያውን ይንኩ (Click)! ማስታወቂያው ላይ ክሊክ ካላደረጉ ሪዋርድ አይከፈልዎትም!");
     if (btn){ btn.disabled = false; btn.textContent = "▶️ Watch Ad"; }
     await renderHome(document.getElementById("view"));
     return;
