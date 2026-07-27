@@ -455,7 +455,8 @@ function toast(msg, type, opts){
   t.innerHTML = `<span class="t-ic">${icons[type]}</span><span class="t-msg">${escapeHtml(msg)}</span>`;
   requestAnimationFrame(() => requestAnimationFrame(() => t.classList.add("show")));
   if (!opts?.sticky){
-    t._h = setTimeout(() => t.classList.remove("show"), 2600);
+    const duration = opts?.duration || (type === "error" ? 9000 : 2600);
+    t._h = setTimeout(() => t.classList.remove("show"), duration);
   }
 }
 
