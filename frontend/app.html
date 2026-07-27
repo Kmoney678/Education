@@ -152,6 +152,29 @@ button:focus, a:focus { outline: none; }
 .skel-line { height: 14px; border-radius: 8px; margin-bottom: 10px; }
 .skel-card { height: 68px; margin-bottom: 10px; border-radius: 18px; }
 
+
+@keyframes dashboardReveal {
+  0% {
+    opacity: 0;
+    transform: perspective(1200px) translateY(35px) scale(0.90) rotateX(10deg);
+    filter: blur(12px);
+  }
+  50% {
+    opacity: 0.8;
+    transform: perspective(1200px) translateY(-6px) scale(1.02) rotateX(-2deg);
+    filter: blur(2px);
+  }
+  100% {
+    opacity: 1;
+    transform: perspective(1200px) translateY(0) scale(1) rotateX(0deg);
+    filter: blur(0);
+  }
+}
+
+.dashboard-enter {
+  animation: dashboardReveal 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
 /* ── Cascade ──────────────────────── */
 .cascade > * { opacity: 0; animation: fadeSlideUp .5s cubic-bezier(.2,.8,.2,1) forwards; }
 .cascade > *:nth-child(1) { animation-delay: .02s; }
@@ -597,7 +620,7 @@ async function renderHome(view){
   ADS = await api("/api/ads/status").catch(() => null);
   ensureMonetagSdk();
   view.innerHTML = `
-    <div class="cascade">
+    <div class="dashboard-enter cascade">
     <div class="hero">
       <div class="hero-top">
         <div class="chip"></div>
