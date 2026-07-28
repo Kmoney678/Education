@@ -3077,17 +3077,6 @@ async def broadcast_to_all_users(text: str, reply_markup: InlineKeyboardMarkup |
     return sent, failed
 
 
-
-@api_app.get("/api/withdrawals/recent")
-async def api_recent_withdrawals():
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT full_name, amount, status, created_at FROM withdrawals ORDER BY id DESC LIMIT 20"
-        )
-        rows = await cur.fetchall()
-        return {"withdrawals": [dict(r) for r in rows]}
-
 @api_app.get("/health")
 async def health_check():
     return {"ok": True}
