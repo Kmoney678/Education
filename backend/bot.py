@@ -945,6 +945,7 @@ class DataEngine:
                 watched_today = (await cur.fetchone())[0]
                 if watched_today >= daily_limit:
                     await db.execute("ROLLBACK")
+                    asyncio.create_task(notify_user_limit_reached(user_id))
                     return False, "daily_limit_reached"
 
                 cur2 = await db.execute(
@@ -1956,6 +1957,56 @@ async def execute_network_vpn_lookup(client_ip: str) -> bool:
     except Exception:
         logger.warning(f"proxycheck lookup failed for ip={client_ip}")
         return False
+
+
+async def notify_user_limit_reached(user_id: int):
+    try:
+        text = (
+            "⚠️ **Daily Limit Reached!**\n\n"
+            "Dear user, you have reached today's ad viewing limit! 🚀\n"
+            "Your limit will reset automatically after 24 hours. You can check your balance or referrals in the meantime:"
+        )
+        await bot.send_message(
+            user_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=generate_dashboard_matrix(user_id)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send limit notification to {user_id}: {e}")
+
+async def notify_ad_limit_reset_loop():
+    while True:
+        try:
+            await asyncio.sleep(3600 * 12)
+            async with aiosqlite.connect(DB_PATH) as db:
+                db.row_factory = aiosqlite.Row
+                cur = await db.execute(
+                    "SELECT DISTINCT user_id FROM ad_events WHERE date(completed_at) = date('now', '-1 day') LIMIT 500"
+                )
+                users = await cur.fetchall()
+                for row in users:
+                    uid = row["user_id"]
+                    today_count = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
+                    if today_count == 0:
+                        try:
+                            text = (
+                                "🎉 **Daily Limit Reset!**\n\n"
+                                "Dear user, your 24-hour ad viewing limit has been reset. You can now watch new ads and earn rewards again! 🚀\n\n"
+                                "Open the Mini App now to start earning:"
+                            )
+                            await bot.send_message(
+                                uid,
+                                text,
+                                parse_mode="Markdown",
+                                reply_markup=generate_dashboard_matrix(uid)
+                            )
+                            await asyncio.sleep(1)
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.warning(f"notify_ad_limit_reset_loop error: {e}")
+        await asyncio.sleep(3600 * 12)
 
 def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
     # index.html (verify screen) is served from the FRONTEND (Vercel), NOT
@@ -3026,6 +3077,17 @@ async def broadcast_to_all_users(text: str, reply_markup: InlineKeyboardMarkup |
     return sent, failed
 
 
+
+@api_app.get("/api/withdrawals/recent")
+async def api_recent_withdrawals():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT full_name, amount, status, created_at FROM withdrawals ORDER BY id DESC LIMIT 20"
+        )
+        rows = await cur.fetchall()
+        return {"withdrawals": [dict(r) for r in rows]}
+
 @api_app.get("/health")
 async def health_check():
     return {"ok": True}
@@ -3390,20 +3452,16 @@ async def api_ads_claim(body: ApiBase):
 
 
 @api_app.get("/api/ads/adsgram-reward")
-async def api_ads_adsgram_reward(userid: int):
-    """AdsGram server-to-server reward postback. Set this as the 'Reward
-    URL' on the video ad block in the AdsGram publisher dashboard
-    (partner.adsgram.ai) using AdsGram's own [userId] macro:
-        https://<this-backend-domain>/api/ads/adsgram-reward?userid=[userId]
-    AdsGram calls this from their own servers ONLY after confirming
-    server-side that the reward was genuinely earned (whatever their
-    criteria — this is the one place that criteria can actually be
-    enforced, since it happens inside AdsGram's own ad unit, completely
-    outside anything our own frontend or backend can observe directly).
-    /api/ads/claim above never pays anymore, so calling our own endpoints
-    directly with no real ad shown earns nothing. Same atomic daily-cap/
-    cooldown guard as everywhere else, so this can't be replayed for
-    repeat payouts either."""
+async def api_ads_adsgram_reward(userid: int, secret: Optional[str] = None):
+    """AdsGram server-to-server reward postback with secret token security.
+    Set this as the 'Reward URL' on the video ad block in the AdsGram publisher dashboard:
+        https://<this-backend-domain>/api/ads/adsgram-reward?userid=[userId]&secret=YOUR_SECRET
+    If ADSGRAM_S2S_SECRET is set in environment, validates the secret parameter to
+    prevent unauthorized direct calls."""
+    s2s_secret = os.getenv("ADSGRAM_S2S_SECRET", "").strip()
+    if s2s_secret and secret != s2s_secret:
+        return {"ok": False, "reason": "unauthorized"}
+
     user = await DataEngine.get_user(userid)
     if not user or user["is_banned"]:
         return {"ok": False}
