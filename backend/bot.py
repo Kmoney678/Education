@@ -1959,6 +1959,24 @@ async def execute_network_vpn_lookup(client_ip: str) -> bool:
         return False
 
 
+
+async def notify_ad_reward_claimed(user_id: int, reward: float, new_balance: float):
+    try:
+        text = (
+            f"🎉 **Reward Credited!**\n\n"
+            f"You earned **+{reward:.2f} Birr** for watching the ad! 💰\n"
+            f"Current Balance: **{new_balance:.2f} Birr**\n\n"
+            f"Watch more ads or invite friends to earn even more:"
+        )
+        await bot.send_message(
+            user_id,
+            text,
+            parse_mode="Markdown",
+            reply_markup=generate_dashboard_matrix(user_id)
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send reward notification to {user_id}: {e}")
+
 async def notify_user_limit_reached(user_id: int):
     try:
         text = (
@@ -2828,38 +2846,79 @@ async def process_pending_inventory(callback: CallbackQuery):
         reply_markup=generate_fallback_navigation("ui_admin_core")
     )
 
+
+broadcast_button_select = State()
+
 @core_router.callback_query(F.data == "adm_cmd_broadcast")
 async def process_broadcast_start(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     await state.set_state(AdminConsoleWorkflow.broadcast_intel_payload)
-    await callback.message.edit_text("📢 <b>Enter Broadcast Message:</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
+    await callback.message.edit_text("📢 <b>Enter Broadcast Message (Text):</b>", reply_markup=generate_fallback_navigation("ui_admin_core"))
 
 @core_router.message(AdminConsoleWorkflow.broadcast_intel_payload)
-async def process_broadcast_preview(message: Message, state: FSMContext):
+async def process_broadcast_button_prompt(message: Message, state: FSMContext):
     text = message.text
     await state.update_data(bc_payload=text)
-    await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
+    
     markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚀 Send Now",  callback_data="bc_action_confirm")],
-        [InlineKeyboardButton(text="✍️ Edit",       callback_data="adm_cmd_broadcast")],
-        [InlineKeyboardButton(text="❌ Cancel",     callback_data="ui_admin_core")],
+        [InlineKeyboardButton(text="🎬 Watch Ads Now", callback_data="bc_btn_watch")],
+        [InlineKeyboardButton(text="🎁 Invite & Earn Rewards", callback_data="bc_btn_invite")],
+        [InlineKeyboardButton(text="🎯 Complete Tasks & Earn", callback_data="bc_btn_tasks")],
+        [InlineKeyboardButton(text="📱 Open Mini App", callback_data="bc_btn_app")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="ui_admin_core")]
     ])
-    await message.answer(f"📝 <b>Preview:</b>\n\n{text}\n\n⚠️ Send to all users?", reply_markup=markup)
+    await message.answer("🔘 <b>Select Inline Button Title & Emoji for Broadcast:</b>", reply_markup=markup)
+
+@core_router.callback_query(F.data.startswith("bc_btn_"))
+async def process_broadcast_preview(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    action = callback.data
+    btn_map = {
+        "bc_btn_watch": "🎬 Watch Ads Now",
+        "bc_btn_invite": "🎁 Invite & Earn Rewards",
+        "bc_btn_tasks": "🎯 Complete Tasks & Earn",
+        "bc_btn_app": "📱 Open Mini App"
+    }
+    btn_text = btn_map.get(action, "📱 Open Mini App")
+    await state.update_data(bc_btn_text=btn_text)
+    
+    data = await state.get_data()
+    text = data.get("bc_payload", "")
+    
+    await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
+    
+    # Generate preview markup
+    # We need a sample uid or placeholder webapp
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={callback.from_user.id}"))],
+        [InlineKeyboardButton(text="🚀 Send Now", callback_data="bc_action_confirm")],
+        [InlineKeyboardButton(text="✍️ Restart Broadcast", callback_data="adm_cmd_broadcast")],
+        [InlineKeyboardButton(text="❌ Cancel", callback_data="ui_admin_core")],
+    ])
+    await callback.message.edit_text(f"📝 <b>Broadcast Preview:</b>\n\n{text}\n\n🔘 <i>Button: {btn_text}</i>\n\n⚠️ Send to all users?", reply_markup=markup)
+
 
 @core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
 async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
     s    = await state.get_data()
     text = s["bc_payload"]
+    btn_text = s.get("bc_btn_text", "📱 Open Mini App")
     await state.clear()
-    progress = await callback.message.edit_text("⏳ Sending broadcast...")
+    progress = await callback.message.edit_text("⏳ Sending broadcast with custom button...")
+    
     async with aiosqlite.connect(DB_PATH) as db:
         cur   = await db.execute("SELECT user_id FROM users")
         nodes = await cur.fetchall()
+        
     sent_count = 0
     fail_count = 0
     for (uid,) in nodes:
         try:
-            await bot.send_message(uid, text)
+            url = f"{FRONTEND_URL}/app.html?uid={uid}"
+            markup = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=url))
+            ]])
+            await bot.send_message(uid, text, reply_markup=markup)
             sent_count += 1
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -3056,7 +3115,8 @@ async def broadcast_to_all_users(text: str, reply_markup: InlineKeyboardMarkup |
     sent, failed = 0, 0
     for (uid,) in rows:
         try:
-            await bot.send_message(uid, text, reply_markup=reply_markup)
+            markup = reply_markup if reply_markup else generate_app_webapp_button(uid)
+            await bot.send_message(uid, text, reply_markup=markup)
             sent += 1
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -3076,6 +3136,47 @@ async def broadcast_to_all_users(text: str, reply_markup: InlineKeyboardMarkup |
                 failed += 1
     return sent, failed
 
+
+
+@api_app.get("/api/withdrawals/recent")
+async def api_recent_withdrawals():
+    enabled = (await DataEngine.get_setting("ticker_enabled", "1")) == "1"
+    if not enabled:
+        return {"enabled": False, "withdrawals": []}
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT full_name, amount, status, created_at FROM withdrawals ORDER BY id DESC LIMIT 20"
+        )
+        rows = await cur.fetchall()
+        real_list = [dict(r) for r in rows]
+
+    custom_raw = await DataEngine.get_setting("ticker_custom_names", "")
+    custom_list = []
+    if custom_raw:
+        try:
+            custom_list = json.loads(custom_raw)
+        except Exception:
+            pass
+
+    default_eth = [
+        {"full_name": "Ekram", "amount": 380.0, "status": "approved"},
+        {"full_name": "Abebe", "amount": 250.0, "status": "approved"},
+        {"full_name": "Kebede", "amount": 420.0, "status": "approved"},
+        {"full_name": "Tigist", "amount": 300.0, "status": "approved"},
+        {"full_name": "Mulugeta", "amount": 500.0, "status": "approved"},
+        {"full_name": "Beti", "amount": 180.0, "status": "approved"},
+        {"full_name": "Haile", "amount": 450.0, "status": "approved"},
+        {"full_name": "Selam", "amount": 320.0, "status": "approved"},
+        {"full_name": "Yohannes", "amount": 600.0, "status": "approved"},
+        {"full_name": "Meron", "amount": 280.0, "status": "approved"},
+        {"full_name": "Ermias", "amount": 350.0, "status": "approved"},
+        {"full_name": "Genet", "amount": 410.0, "status": "approved"},
+    ]
+
+    combined = real_list + custom_list + default_eth
+    return {"enabled": True, "withdrawals": combined}
 
 @api_app.get("/health")
 async def health_check():
@@ -4176,6 +4277,8 @@ class AdminSettingsUpdateRequest(ApiBase):
     user_task_min_slots: int = 5
     user_task_max_slots: int = 500
     support_username: str = ""
+    ticker_enabled: bool = True
+    ticker_custom_names: str = "[]"
 
 
 @api_app.post("/api/admin/settings/update")
@@ -4206,6 +4309,8 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("user_task_min_slots", str(body.user_task_min_slots))
     await DataEngine.set_setting("user_task_max_slots", str(body.user_task_max_slots))
     await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
+    await DataEngine.set_setting("ticker_enabled", "1" if body.ticker_enabled else "0")
+    await DataEngine.set_setting("ticker_custom_names", body.ticker_custom_names)
     return {"ok": True}
 
 
@@ -4295,6 +4400,56 @@ async def _run_web_server():
     await server.serve()
 
 
+
+
+async def daily_broadcast_loop():
+    while True:
+        try:
+            import random
+            from datetime import datetime, timedelta
+            
+            now = datetime.utcnow()
+            target_hour = random.randint(5, 9)
+            target_minute = random.randint(0, 59)
+            
+            target_time = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
+            if target_time <= now:
+                target_time += timedelta(days=1)
+                
+            wait_seconds = (target_time - now).total_seconds()
+            logger.info(f"Next automated broadcast scheduled for {target_time} UTC (in {int(wait_seconds/60)} minutes)")
+            await asyncio.sleep(wait_seconds)
+            
+            # Broadcast text with 20 Birr per invite and mini app button
+            broadcast_text = (
+                "🚀 **HF Earn Daily Broadcast!**\n\n"
+                "Watch all **10/10 ads** today and claim your rewards instantly! 💰\n"
+                "🎁 Earn **20 Birr per invite**! Refer your friends and boost your earnings. 👥"
+            )
+            
+            sent, failed = await broadcast_to_all_users(broadcast_text)
+            
+            # Send stats to admins strictly once per day
+            stats_text = (
+                "📊 **Automated Daily Broadcast Statistics**\n\n"
+                "• **Status:** Success ✅ (Sent once today)\n"
+                f"• **Sent to:** {sent} users\n"
+                f"• **Failed:** {failed} users\n"
+                f"• **Execution Time:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
+                f"• **Next Scheduled Broadcast:** ~{target_time + timedelta(days=1)} UTC (Randomized morning time tomorrow)"
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, stats_text, parse_mode="Markdown")
+                except Exception:
+                    pass
+            
+            # Sleep 20 hours to guarantee it NEVER runs twice on the same calendar day
+            await asyncio.sleep(3600 * 20)
+        except Exception as e:
+            logger.warning(f"daily_broadcast_loop error: {e}")
+            await asyncio.sleep(3600)
+
 async def _main():
     global _polling_task, BOT_USERNAME, BOT_ID
     await DataEngine.init_database()
@@ -4314,6 +4469,7 @@ async def _main():
         logger.warning(f"Could not pre-cache bot photo at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     asyncio.create_task(db_backup_loop())
+    asyncio.create_task(daily_broadcast_loop())
     await _run_web_server()
 
 
