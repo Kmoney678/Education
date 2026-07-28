@@ -175,6 +175,19 @@ button:focus, a:focus { outline: none; }
   animation: dashboardReveal 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards;
 }
 
+
+#view {
+  opacity: 0;
+  transform: perspective(1000px) translateY(30px) scale(0.94);
+  filter: blur(8px);
+  transition: opacity 0.65s cubic-bezier(0.16, 1, 0.3, 1), transform 0.65s cubic-bezier(0.16, 1, 0.3, 1), filter 0.65s cubic-bezier(0.16, 1, 0.3, 1);
+}
+#view.revealed {
+  opacity: 1;
+  transform: perspective(1000px) translateY(0) scale(1);
+  filter: blur(0);
+}
+
 /* ── Cascade ──────────────────────── */
 .cascade > * { opacity: 0; animation: fadeSlideUp .5s cubic-bezier(.2,.8,.2,1) forwards; }
 .cascade > *:nth-child(1) { animation-delay: .02s; }
@@ -2085,7 +2098,13 @@ async function recheckGate(){
   function dismissSplash(){
     const elapsed = Date.now() - started;
     const wait = Math.max(0, MIN_SPLASH_MS - elapsed);
-    setTimeout(() => splash.classList.add("hide"), wait);
+    setTimeout(() => {
+      splash.classList.add("hide");
+      setTimeout(() => {
+        const v = document.getElementById("view");
+        if (v) v.classList.add("revealed");
+      }, 80);
+    }, wait);
   }
 
   // ── Telegram-only gate ──────────────────────────────────────────
