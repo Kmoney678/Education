@@ -1755,9 +1755,7 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
         ref = await DataEngine.get_pending_referral(uid) or 0
 
     if await DataEngine.is_verified(uid):
-        await callback.message.answer("✅ Identity clear!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]]))
+        await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
     else:
         acc = await DataEngine.get_user(uid)
         if acc and acc["last_verify_msg_id"]:
@@ -1831,9 +1829,7 @@ async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
             return
     await callback.message.edit_text(
         "🏠 <b>Main Dashboard Menu / ዋና ማውጫ</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]])
+        reply_markup=generate_dashboard_matrix(uid)
     )
 
 @core_router.callback_query(F.data == "ui_fetch_balance")
@@ -2021,9 +2017,7 @@ async def notify_ad_limit_reset_loop():
                                 uid,
                                 text,
                                 parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]])
+                                reply_markup=generate_dashboard_matrix(uid)
                             )
                             await asyncio.sleep(1)
                         except Exception:
@@ -2283,9 +2277,7 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         "📨 <b>Withdrawal Submitted!</b> Processing within 2-24 hours.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]])
+        reply_markup=generate_dashboard_matrix(uid)
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3340,9 +3332,7 @@ async def api_verify(body: VerifyRequest, request: Request):
     try:
         await bot.send_message(
             uid, "✅ <b>Verified!</b> Welcome in.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]])
+            reply_markup=generate_dashboard_matrix(uid)
         )
     except Exception:
         pass
