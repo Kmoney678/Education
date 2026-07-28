@@ -1755,7 +1755,9 @@ async def process_channel_revalidation(callback: CallbackQuery, state: FSMContex
         ref = await DataEngine.get_pending_referral(uid) or 0
 
     if await DataEngine.is_verified(uid):
-        await callback.message.answer("✅ Identity clear!", reply_markup=generate_dashboard_matrix(uid))
+        await callback.message.answer("✅ Identity clear!", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]]))
     else:
         acc = await DataEngine.get_user(uid)
         if acc and acc["last_verify_msg_id"]:
@@ -1799,7 +1801,9 @@ async def process_start_command(message: Message, state: FSMContext):
         return
 
     if await DataEngine.is_verified(uid):
-        return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=generate_dashboard_matrix(uid))
+        return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]]))
 
     # ── Clean up any stale, unfinished verification widget ────────────────
     # If the user restarts the bot (or taps an old shared /start link)
@@ -1829,7 +1833,9 @@ async def process_navigation_home(callback: CallbackQuery, state: FSMContext):
             return
     await callback.message.edit_text(
         "🏠 <b>Main Dashboard Menu / ዋና ማውጫ</b>",
-        reply_markup=generate_dashboard_matrix(uid)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]])
     )
 
 @core_router.callback_query(F.data == "ui_fetch_balance")
@@ -2017,7 +2023,9 @@ async def notify_ad_limit_reset_loop():
                                 uid,
                                 text,
                                 parse_mode="Markdown",
-                                reply_markup=generate_dashboard_matrix(uid)
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]])
                             )
                             await asyncio.sleep(1)
                         except Exception:
@@ -2277,7 +2285,9 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         "📨 <b>Withdrawal Submitted!</b> Processing within 2-24 hours.",
-        reply_markup=generate_dashboard_matrix(uid)
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]])
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3332,7 +3342,9 @@ async def api_verify(body: VerifyRequest, request: Request):
     try:
         await bot.send_message(
             uid, "✅ <b>Verified!</b> Welcome in.",
-            reply_markup=generate_dashboard_matrix(uid)
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]])
         )
     except Exception:
         pass
@@ -4402,53 +4414,6 @@ async def _run_web_server():
 
 
 
-async def daily_broadcast_loop():
-    while True:
-        try:
-            import random
-            from datetime import datetime, timedelta
-            
-            now = datetime.utcnow()
-            target_hour = random.randint(5, 9)
-            target_minute = random.randint(0, 59)
-            
-            target_time = now.replace(hour=target_hour, minute=target_minute, second=0, microsecond=0)
-            if target_time <= now:
-                target_time += timedelta(days=1)
-                
-            wait_seconds = (target_time - now).total_seconds()
-            logger.info(f"Next automated broadcast scheduled for {target_time} UTC (in {int(wait_seconds/60)} minutes)")
-            await asyncio.sleep(wait_seconds)
-            
-            # Broadcast text with 20 Birr per invite and mini app button
-            broadcast_text = (
-                "🚀 **HF Earn Daily Broadcast!**\n\n"
-                "Watch all **10/10 ads** today and claim your rewards instantly! 💰\n"
-                "🎁 Earn **20 Birr per invite**! Refer your friends and boost your earnings. 👥"
-            )
-            
-            sent, failed = await broadcast_to_all_users(broadcast_text)
-            
-            # Send stats to admins strictly once per day
-            stats_text = (
-                "📊 **Automated Daily Broadcast Statistics**\n\n"
-                "• **Status:** Success ✅ (Sent once today)\n"
-                f"• **Sent to:** {sent} users\n"
-                f"• **Failed:** {failed} users\n"
-                f"• **Execution Time:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-                f"• **Next Scheduled Broadcast:** ~{target_time + timedelta(days=1)} UTC (Randomized morning time tomorrow)"
-            )
-            for admin_id in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin_id, stats_text, parse_mode="Markdown")
-                except Exception:
-                    pass
-            
-            # Sleep 20 hours to guarantee it NEVER runs twice on the same calendar day
-            await asyncio.sleep(3600 * 20)
-        except Exception as e:
-            logger.warning(f"daily_broadcast_loop error: {e}")
-            await asyncio.sleep(3600)
 
 async def _main():
     global _polling_task, BOT_USERNAME, BOT_ID
@@ -4469,7 +4434,6 @@ async def _main():
         logger.warning(f"Could not pre-cache bot photo at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     asyncio.create_task(db_backup_loop())
-    asyncio.create_task(daily_broadcast_loop())
     await _run_web_server()
 
 
