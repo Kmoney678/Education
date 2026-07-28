@@ -1996,11 +1996,11 @@ async def notify_user_limit_reached(user_id: int):
 async def notify_ad_limit_reset_loop():
     while True:
         try:
-            await asyncio.sleep(3600 * 12)
+            await asyncio.sleep(3600 * 6)
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
                 cur = await db.execute(
-                    "SELECT DISTINCT user_id FROM ad_events WHERE date(completed_at) = date('now', '-1 day') LIMIT 500"
+                    "SELECT DISTINCT user_id FROM ad_events WHERE date(completed_at) = date('now', '-1 day')"
                 )
                 users = await cur.fetchall()
                 for row in users:
@@ -2017,14 +2017,16 @@ async def notify_ad_limit_reset_loop():
                                 uid,
                                 text,
                                 parse_mode="Markdown",
-                                reply_markup=generate_dashboard_matrix(uid)
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
+                                ]])
                             )
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(0.3)
                         except Exception:
                             pass
         except Exception as e:
             logger.warning(f"notify_ad_limit_reset_loop error: {e}")
-        await asyncio.sleep(3600 * 12)
+        await asyncio.sleep(3600 * 6)
 
 def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
     # index.html (verify screen) is served from the FRONTEND (Vercel), NOT
