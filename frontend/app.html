@@ -188,60 +188,6 @@ button:focus, a:focus { outline: none; }
   filter: blur(0);
 }
 
-
-/* ── Live Payout Ticker ──────────────── */
-.ticker-wrap {
-  width: 100%;
-  overflow: hidden;
-  background: rgba(200, 242, 77, 0.06);
-  border: 1px solid rgba(200, 242, 77, 0.18);
-  border-radius: 14px;
-  padding: 8px 12px;
-  margin-bottom: 16px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  backdrop-filter: blur(10px);
-}
-.ticker-badge {
-  font-size: 0.65rem;
-  font-weight: 800;
-  color: var(--lime);
-  background: rgba(200, 242, 77, 0.15);
-  padding: 3px 8px;
-  border-radius: 6px;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  flex-shrink: 0;
-  font-family: 'Unbounded', sans-serif;
-}
-.ticker-container {
-  overflow: hidden;
-  white-space: nowrap;
-  flex: 1;
-  position: relative;
-}
-.ticker-track {
-  display: inline-block;
-  white-space: nowrap;
-  animation: tickerScroll 25s linear infinite;
-  font-size: 0.76rem;
-  font-family: 'JetBrains Mono', monospace;
-  color: var(--ink);
-  font-weight: 600;
-}
-.ticker-track:hover {
-  animation-play-state: paused;
-}
-.ticker-item {
-  display: inline-block;
-  margin-right: 32px;
-}
-@keyframes tickerScroll {
-  0% { transform: translateX(0); }
-  100% { transform: translateX(-50%); }
-}
-
 /* ── Cascade ──────────────────────── */
 .cascade > * { opacity: 0; animation: fadeSlideUp .5s cubic-bezier(.2,.8,.2,1) forwards; }
 .cascade > *:nth-child(1) { animation-delay: .02s; }
@@ -687,14 +633,6 @@ async function renderHome(view){
   ADS = await api("/api/ads/status").catch(() => null);
   ensureMonetagSdk();
   view.innerHTML = `
-    
-    <div class="ticker-wrap" id="payoutTicker" style="display:none;">
-      <div class="ticker-badge">Live Payouts</div>
-      <div class="ticker-container">
-        <div class="ticker-track" id="tickerTrack"></div>
-      </div>
-    </div>
-
     <div class="dashboard-enter cascade">
     <div class="hero">
       <div class="hero-top">
@@ -2227,32 +2165,3 @@ async function recheckGate(){
 </script>
 </body>
 </html>
-
-<script>
-
-async function loadPayoutTicker() {
-  try {
-    const res = await api("/api/withdrawals/recent");
-    const list = res.withdrawals || [];
-    if (list.length === 0) return;
-    const track = document.getElementById("tickerTrack");
-    const wrap = document.getElementById("payoutTicker");
-    if (!track || !wrap) return;
-
-    let html = "";
-    list.forEach(w => {
-      const name = w.full_name || "User";
-      const amt = Number(w.amount).toFixed(2);
-      const statusText = w.status === "approved" ? "✅ Received" : "⏳ Requested";
-      html += `<span class="ticker-item">🎉 <b>${name}</b> ${statusText} <b>${amt} Birr</b></span>`;
-    });
-    // Duplicate for seamless infinite loop
-    track.innerHTML = html + html;
-    wrap.style.display = "flex";
-  } catch (e) {
-    // silent fail for ticker
-  }
-}
-
-setTimeout(loadPayoutTicker, 500);
-</script>
