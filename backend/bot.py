@@ -1801,9 +1801,7 @@ async def process_start_command(message: Message, state: FSMContext):
         return
 
     if await DataEngine.is_verified(uid):
-        return await message.answer("✅ <b>Welcome back!</b> Access granted.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]]))
+        return await message.answer("✅ <b>Welcome back!</b> Choose an option below:", reply_markup=generate_dashboard_matrix(uid))
 
     # ── Clean up any stale, unfinished verification widget ────────────────
     # If the user restarts the bot (or taps an old shared /start link)
