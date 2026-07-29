@@ -188,6 +188,60 @@ button:focus, a:focus { outline: none; }
   filter: blur(0);
 }
 
+
+/* ── Live Payout Ticker ──────────────── */
+.ticker-wrap {
+  width: 100%;
+  overflow: hidden;
+  background: rgba(200, 242, 77, 0.06);
+  border: 1px solid rgba(200, 242, 77, 0.18);
+  border-radius: 14px;
+  padding: 8px 12px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  backdrop-filter: blur(10px);
+}
+.ticker-badge {
+  font-size: 0.65rem;
+  font-weight: 800;
+  color: var(--lime);
+  background: rgba(200, 242, 77, 0.15);
+  padding: 3px 8px;
+  border-radius: 6px;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  flex-shrink: 0;
+  font-family: 'Unbounded', sans-serif;
+}
+.ticker-container {
+  overflow: hidden;
+  white-space: nowrap;
+  flex: 1;
+  position: relative;
+}
+.ticker-track {
+  display: inline-block;
+  white-space: nowrap;
+  animation: tickerScroll 25s linear infinite;
+  font-size: 0.76rem;
+  font-family: 'JetBrains Mono', monospace;
+  color: var(--ink);
+  font-weight: 600;
+}
+.ticker-track:hover {
+  animation-play-state: paused;
+}
+.ticker-item {
+  display: inline-block;
+  margin-right: 32px;
+}
+@keyframes tickerScroll {
+  0% { transform: translateX(0); }
+  100% { transform: translateX(-50%); }
+}
+
 /* ── Cascade ──────────────────────── */
 .cascade > * { opacity: 0; animation: fadeSlideUp .5s cubic-bezier(.2,.8,.2,1) forwards; }
 .cascade > *:nth-child(1) { animation-delay: .02s; }
@@ -633,6 +687,14 @@ async function renderHome(view){
   ADS = await api("/api/ads/status").catch(() => null);
   ensureMonetagSdk();
   view.innerHTML = `
+    
+    <div class="ticker-wrap" id="payoutTicker" style="display:none !important;" hidden>
+      <div class="ticker-badge">Live Payouts</div>
+      <div class="ticker-container">
+        <div class="ticker-track" id="tickerTrack"></div>
+      </div>
+    </div>
+
     <div class="dashboard-enter cascade">
     <div class="hero">
       <div class="hero-top">
@@ -1935,7 +1997,24 @@ async function adminSettings(body){
       <input id="stRefSkipMax" type="number" min="0" value="${s.referral_skip_max}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
-    <h2 class="sect">User Self-Serve Tasks (promote own channel)</h2>
+    
+      <h2 class="sect">Live Payout Ticker Settings</h2>
+      <div class="card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
+          <div style="font-weight:700;font-size:.88rem">Enable Live Ticker</div>
+          <input type="checkbox" id="stTickerEnabled" style="width:20px;height:20px;margin:0;" ${s.ticker_enabled ? "checked" : ""}>
+        </div>
+        <label class="f">Add Custom Name & Amount</label>
+        <div style="display:flex;gap:8px;margin-bottom:12px;">
+          <input id="stCustomName" placeholder="Name (e.g. Ekram)" style="flex:1;margin-bottom:0;">
+          <input id="stCustomAmount" type="number" placeholder="Amount" style="width:90px;margin-bottom:0;">
+          <button class="btn sm gold" type="button" style="width:auto;padding:10px 14px;" onclick="addCustomTickerName()">Add</button>
+        </div>
+        <div id="customNamesList" style="font-size:0.8rem;margin-top:8px;"></div>
+      </div>
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+
+      <h2 class="sect">User Self-Serve Tasks (promote own channel)</h2>
     <div class="card">
       <div class="mini" style="margin-bottom:10px">
         Lets any user pay from their own balance to advertise their own
@@ -2121,7 +2200,6 @@ async function recheckGate(){
     return;
   }
 
-  alert("DEBUG: BACKEND_URL = " + BACKEND_URL + " | initData length = " + (tg.initData ? tg.initData.length : 0));
   try {
     await refreshMe();
 
@@ -2142,7 +2220,6 @@ async function recheckGate(){
     await render();
     dismissSplash();
   } catch (e) {
-    alert("DEBUG CATCH: name=" + e.name + " | message=" + e.message);
     if (e.message === "not_verified"){
       // This account has never completed the verification page — most
       // commonly because the Mini App was opened via Telegram's native
@@ -2167,3 +2244,83 @@ async function recheckGate(){
 </script>
 </body>
 </html>
+
+<script>
+
+async function loadPayoutTicker() {
+  try {
+    const res = await api("/api/withdrawals/recent");
+    const wrap = document.getElementById("payoutTicker");
+    const track = document.getElementById("tickerTrack");
+    if (!wrap || !track) return;
+
+    if (!res || !res.enabled) {
+      wrap.style.display = "none";
+      return;
+    }
+
+    const list = res.withdrawals || [];
+    // Requirement: only scroll if at least 10 entries exist
+    if (list.length < 10) {
+      wrap.style.display = "none";
+      return;
+    }
+
+    let html = "";
+    list.forEach(w => {
+      const name = w.full_name || w.name || "User";
+      const amt = Number(w.amount || 0).toFixed(2);
+      const statusText = w.status === "approved" ? "✅ Received" : "⏳ Requested";
+      html += `<span class="ticker-item">🎉 <b>${name}</b> ${statusText} <b>${amt} Birr</b></span>`;
+    });
+    track.innerHTML = html + html;
+    wrap.style.display = "flex";
+  } catch (e) {
+    // silent fail
+  }
+}
+
+setTimeout(loadPayoutTicker, 500);
+</script>
+
+<script>
+
+let customTickerNamesList = [];
+
+function renderCustomTickerNames() {
+  const box = document.getElementById("customNamesList");
+  if (!box) return;
+  if (customTickerNamesList.length === 0) {
+    box.innerHTML = `<span style="color:var(--ink-faint)">No custom names added yet. Default Ethiopian names will be used.</span>`;
+    return;
+  }
+  let h = "";
+  customTickerNamesList.forEach((item, idx) => {
+    h += `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05)">`
+      + `<span>👤 <b>${item.full_name}</b> - ${item.amount} Birr</span>`
+      + `<button type="button" class="btn sm danger" style="width:auto;padding:2px 8px;" onclick="removeCustomTickerName(${idx})">🗑</button>`
+      + `</div>`;
+  });
+  box.innerHTML = h;
+}
+
+function addCustomTickerName() {
+  const name = document.getElementById("stCustomName")?.value?.trim();
+  const amt = parseFloat(document.getElementById("stCustomAmount")?.value || "0");
+  if (!name || amt <= 0) {
+    toast("⚠️ Please enter valid name and amount");
+    return;
+  }
+  customTickerNamesList.push({ full_name: name, amount: amt, status: "approved" });
+  document.getElementById("stCustomName").value = "";
+  document.getElementById("stCustomAmount").value = "";
+  renderCustomTickerNames();
+  toast("✅ Added to list. Click 'Save Settings' to apply.");
+}
+
+function removeCustomTickerName(idx) {
+  customTickerNamesList.splice(idx, 1);
+  renderCustomTickerNames();
+}
+
+</script>
