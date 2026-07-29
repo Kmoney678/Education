@@ -2121,6 +2121,7 @@ async function recheckGate(){
     return;
   }
 
+  alert("DEBUG: BACKEND_URL = " + BACKEND_URL + " | initData length = " + (tg.initData ? tg.initData.length : 0));
   try {
     await refreshMe();
 
@@ -2141,6 +2142,7 @@ async function recheckGate(){
     await render();
     dismissSplash();
   } catch (e) {
+    alert("DEBUG CATCH: name=" + e.name + " | message=" + e.message);
     if (e.message === "not_verified"){
       // This account has never completed the verification page — most
       // commonly because the Mini App was opened via Telegram's native
