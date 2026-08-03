@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import logging
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict
 import time
 
@@ -236,6 +236,12 @@ CREATE TABLE IF NOT EXISTS fraud_log (
     logged_at   TEXT    DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS daily_checkins (
+    user_id         INTEGER PRIMARY KEY,
+    last_claim_date TEXT,
+    streak          INTEGER DEFAULT 0
+);
+
 -- Durable (DB-backed) stand-in for the old FSMContext-only
 -- "stashed_referrer_id". A person can sit on the "join these channels
 -- first" screen for a long time before tapping Joined, and the bot's
@@ -302,6 +308,16 @@ CREATE TABLE IF NOT EXISTS ad_events (
 );
 CREATE INDEX IF NOT EXISTS idx_ad_events_user_kind ON ad_events(user_id, kind, completed_at);
 
+-- Tracks the daily "ads reset" notifications so each user gets at most
+-- one of each message per calendar day, even though the sender loop
+-- wakes up and re-checks multiple times a day.
+CREATE TABLE IF NOT EXISTS daily_notify_log (
+    user_id     INTEGER,
+    notify_type TEXT,
+    notify_date TEXT,
+    PRIMARY KEY (user_id, notify_type, notify_date)
+);
+
 -- ─────────────────────────────────────────────────────────────────────────
 -- PERFORMANCE INDEXES
 -- ብዙ users ሲኖሩ balance/referrals/withdraw ቁልፎች የሚጠቀሙባቸውን query ዎች
@@ -323,6 +339,7 @@ CREATE INDEX IF NOT EXISTS idx_users_last_seen      ON users(last_seen);
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('reward_per_referral', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('min_withdrawal', '50');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('min_ads_for_withdrawal', '30');
 
 -- AdsGram — rewarded video
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_enabled', '0');
@@ -341,6 +358,7 @@ INSERT OR IGNORE INTO settings (key, value) VALUES ('user_task_max_slots', '500'
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_reward_amount', '0.5');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_daily_limit', '10');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ad_cooldown_seconds', '30');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('ads_reset_broadcast_enabled', '1');
 
 -- AdsGram — Direct Link
 INSERT OR IGNORE INTO settings (key, value) VALUES ('adsgram_direct_link', '');
@@ -381,6 +399,12 @@ MIGRATION_STATEMENTS = [
         user_id INTEGER, reason TEXT, ip_address TEXT,
         details TEXT DEFAULT '', logged_at TEXT DEFAULT (datetime('now'))
     )""",
+    """CREATE TABLE IF NOT EXISTS daily_checkins (
+        user_id INTEGER PRIMARY KEY,
+        last_claim_date TEXT,
+        streak INTEGER DEFAULT 0
+    )""",
+    "ALTER TABLE withdrawals   ADD COLUMN method TEXT DEFAULT 'telebirr'",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -738,7 +762,7 @@ class DataEngine:
 
     @staticmethod
     async def create_withdrawal_atomic(
-        user_id: int, amount: float, full_name: str, phone: str
+        user_id: int, amount: float, full_name: str, phone: str, method: str = "telebirr"
     ) -> tuple[int, bool]:
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN EXCLUSIVE")
@@ -752,8 +776,8 @@ class DataEngine:
                     return 0, False
 
                 cur2 = await db.execute(
-                    "INSERT INTO withdrawals (user_id, amount, full_name, phone) VALUES (?,?,?,?)",
-                    (user_id, amount, full_name, phone),
+                    "INSERT INTO withdrawals (user_id, amount, full_name, phone, method) VALUES (?,?,?,?,?)",
+                    (user_id, amount, full_name, phone, method),
                 )
                 tid = cur2.lastrowid
                 await db.execute(
@@ -882,6 +906,16 @@ class DataEngine:
             return row[0] if row else 0
 
     @staticmethod
+    async def count_total_completed_ads(user_id: int) -> int:
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT COUNT(*) FROM ad_events WHERE user_id=? AND status='completed'",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0
+
+    @staticmethod
     async def get_last_ad_event(user_id: int, kind: str):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -908,13 +942,16 @@ class DataEngine:
 
     @staticmethod
     async def claim_video_ad_atomic(
-        user_id: int, reward: float, daily_limit: int, cooldown_seconds: int
+        user_id: int, reward: float, daily_limit: int, cooldown_seconds: int,
+        skip_enabled: bool = True,
     ) -> tuple[bool, str]:
         """Re-checks the daily cap and cooldown AND records+pays the
         reward, all inside one BEGIN EXCLUSIVE transaction.
         Rule: Alternating ad attempts based on completed/warning count today.
         - 1st, 3rd, 5th, 7th... (Odd attempts): No pay, record warning.
-        - 2nd, 4th, 6th, 8th... (Even attempts): Pay out reward."""
+        - 2nd, 4th, 6th, 8th... (Even attempts): Pay out reward.
+        Pass skip_enabled=False (admin setting) to disable the odd/even
+        withholding entirely — every attempt then pays out normally."""
         async with aiosqlite.connect(DB_PATH) as db:
             await db.execute("BEGIN EXCLUSIVE")
             try:
@@ -928,7 +965,7 @@ class DataEngine:
                 attempt_num = completed_or_warned + 1  # 1st ad = 1, 2nd ad = 2, 3rd ad = 3...
 
                 # Odd numbered attempts (1, 3, 5, 7...) trigger the click reminder & withhold reward
-                if attempt_num % 2 != 0:
+                if skip_enabled and attempt_num % 2 != 0:
                     await db.execute(
                         "INSERT INTO ad_events (user_id, kind, status, reward) "
                         "VALUES (?, 'video', 'warning', 0)",
@@ -977,6 +1014,95 @@ class DataEngine:
             except Exception:
                 await db.execute("ROLLBACK")
                 raise
+
+    @staticmethod
+    async def get_daily_checkin_status(user_id: int) -> dict:
+        """Returns whether today's check-in is already claimed, and the
+        current streak, without touching anything."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                "SELECT last_claim_date, streak FROM daily_checkins WHERE user_id=?",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        if not row:
+            return {"claimed_today": False, "streak": 0}
+        return {"claimed_today": row["last_claim_date"] == today, "streak": row["streak"] or 0}
+
+    @staticmethod
+    async def has_recent_completed_ad(user_id: int, within_seconds: int = 180) -> bool:
+        """Daily check-in requires actually watching an ad first — this
+        checks for a genuinely S2S-confirmed ad view (kind='video',
+        status='completed') in the last `within_seconds`, the same trust
+        model already used for the regular Watch Ad reward, so check-in
+        can't be claimed without really watching something."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT completed_at FROM ad_events WHERE user_id=? AND kind='video' "
+                "AND status='completed' ORDER BY completed_at DESC LIMIT 1",
+                (user_id,),
+            )
+            row = await cur.fetchone()
+        if not row or not row[0]:
+            return False
+        try:
+            elapsed = (datetime.utcnow() - datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")).total_seconds()
+            return 0 <= elapsed <= within_seconds
+        except Exception:
+            return False
+
+    @staticmethod
+    async def claim_daily_checkin_atomic(user_id: int, reward: float) -> tuple[bool, str, int]:
+        """Re-checks 'not already claimed today' AND pays the reward, all
+        inside one BEGIN EXCLUSIVE transaction — same double-claim
+        protection pattern as withdrawals. Streak continues if the last
+        claim was yesterday, otherwise resets to 1.
+        Returns (ok, reason, new_streak)."""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        yesterday = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%d")
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("BEGIN EXCLUSIVE")
+            try:
+                cur = await db.execute(
+                    "SELECT last_claim_date, streak FROM daily_checkins WHERE user_id=?",
+                    (user_id,),
+                )
+                row = await cur.fetchone()
+                if row and row[0] == today:
+                    await db.execute("ROLLBACK")
+                    return False, "already_claimed", row[1] or 0
+
+                new_streak = ((row[1] or 0) + 1) if (row and row[0] == yesterday) else 1
+
+                await db.execute(
+                    "INSERT INTO daily_checkins (user_id, last_claim_date, streak) VALUES (?, ?, ?) "
+                    "ON CONFLICT(user_id) DO UPDATE SET last_claim_date=excluded.last_claim_date, streak=excluded.streak",
+                    (user_id, today, new_streak),
+                )
+                await db.execute(
+                    "UPDATE users SET balance = ROUND(balance + ?, 2) WHERE user_id = ?",
+                    (reward, user_id),
+                )
+                await db.execute("COMMIT")
+                return True, "", new_streak
+            except Exception:
+                await db.execute("ROLLBACK")
+                raise
+
+    @staticmethod
+    async def mark_notified_today(user_id: int, notify_type: str) -> bool:
+        """Records that user_id received notify_type today. Returns True the
+        first time (caller should send), False if already sent today."""
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "INSERT OR IGNORE INTO daily_notify_log (user_id, notify_type, notify_date) "
+                "VALUES (?, ?, date('now'))",
+                (user_id, notify_type),
+            )
+            await db.commit()
+            return cur.rowcount > 0
 
     @staticmethod
     async def log_ad_click(user_id: int, kind: str):
@@ -1317,11 +1443,23 @@ class DataEngine:
 #
 # DECISION (ከ ANY ነባር user ጋር ሲነጻጸር)፦
 #   • Self-referral (referrer_id == new_user_id)        → BAN (ሁልጊዜ ግልጽ ነው)
-#   • Score ≥ 3/4 ምድቦች ከአንድ ተመሳሳይ user ጋር ይገጣጠማሉ        → BAN
-#   • Score 1-2                                          → LOG ብቻ (admin review)
-#   • referrer ጋር ብቻ: fingerprint + (IP ወይም hardware)
-#     ሁለቱም ይገጣጠማሉ                                       → BAN ("ራሱ ራሱን ጋበዘ")
-#   • referrer ጋር fingerprint ብቻ ወይም IP ብቻ ይገጣጠማል         → LOG ብቻ
+#   • Weighted score ≥ 4/6 possible points, correlating to the SAME other
+#     user                                                    → BAN
+#     (fingerprint=2, hardware=1, ip=1, tg_device=1 — the combined
+#     `fingerprint` hash is far more unique than any single sub-signal, since
+#     it also folds in the full User-Agent string, timezone, cpu core count,
+#     and language; `hardware` alone is just canvas+webgl and, on its own,
+#     commonly collides across totally unrelated people who own the same
+#     inexpensive phone model; `ip` and `tg_device` collide even more easily
+#     — shared WiFi/CGNAT and "everyone's on the same Telegram Android
+#     build" are both completely normal. Requiring the strong fingerprint
+#     signal (or hardware) to be part of the match, not just any 3 weak
+#     signals, keeps two unrelated people who happen to share a phone model
+#     + network + app version from being auto-banned.)
+#   • Score 1-3                                          → LOG ብቻ (admin review)
+#   • referrer ጋር ብቻ: fingerprint=2, ip=1, hw=1 — ድምር ≥ 3 ሲደርስ         → BAN
+#     ("ራሱ ራሱን ጋበዘ")
+#   • referrer ጋር ድምር < 3                                  → LOG ብቻ
 #   • IP farm: ብዙ users በአንድ IP ላይ *እና* ጥቂት የተለያዩ
 #     fingerprints (ስለዚህ duplicate ስክሪፕት farm ይመስላል)      → BAN
 #     ብዙ users በአንድ IP ላይ ግን እያንዳንዱ የተለየ fingerprint
@@ -1331,10 +1469,18 @@ class DataEngine:
 # ስልክ ሞዴል ብቻ) ብቻውን ሰውን አያስታግድም።
 # ─────────────────────────────────────────────────────────────────────────────
 
-CORRELATION_BAN_THRESHOLD = 3   # ከ 4ቱ ምድቦች ቢያንስ 3 ሲገጣጠሙ ብቻ BAN
+CORRELATION_BAN_THRESHOLD = 4   # ከ 6 ሊደረስ ከሚችል ድምር ውስጥ ቢያንስ 4 ሲደርስ ብቻ BAN
 MAX_USERS_PER_IP          = 10  # ከዚህ በላይ → ጠቅሰ ብቻ (review)
 MAX_USERS_PER_IP_BAN      = 40  # ከዚህ በላይ *እና* ዝቅተኛ fingerprint diversity → BAN
 IP_FARM_MIN_FP_RATIO      = 0.5 # distinct_fp / user_count ከዚህ በታች ከሆነ "duplicate ስክሪፕት" ይመስላል
+
+# Per-category weights — fingerprint (the combined hash) is far more
+# unique than any single sub-signal and therefore worth more toward the
+# ban threshold. See the comment block above for why.
+WEIGHT_FINGERPRINT = 2
+WEIGHT_HARDWARE    = 1
+WEIGHT_IP          = 1
+WEIGHT_TG_DEVICE   = 1
 
 
 def _category_match_score(
@@ -1344,20 +1490,21 @@ def _category_match_score(
     tg_platform: str, tg_version: str, tg_ok: bool,
     row: dict,
 ) -> tuple[int, list]:
-    """Counts how many independent signal categories match a single candidate row."""
+    """Weighted sum of how many independent signal categories match a
+    single candidate row — see WEIGHT_* constants above."""
     score = 0
     matched = []
     if fp_ok and row.get("fingerprint") and row["fingerprint"] == fingerprint:
-        score += 1
+        score += WEIGHT_FINGERPRINT
         matched.append("fingerprint")
     if hw_ok and row.get("canvas_hash") == canvas_hash and row.get("webgl_hash") == webgl_hash:
-        score += 1
+        score += WEIGHT_HARDWARE
         matched.append("hardware")
     if ip_ok and row.get("ip_address") and row["ip_address"] == client_ip:
-        score += 1
+        score += WEIGHT_IP
         matched.append("ip")
     if tg_ok and row.get("tg_platform") == tg_platform and row.get("tg_version") == tg_version:
-        score += 1
+        score += WEIGHT_TG_DEVICE
         matched.append("tg_device")
     return score, matched
 
@@ -1373,17 +1520,21 @@ async def evaluate_clone_risk(
     canvas_hash: str = "",
     webgl_hash: str = "",
     screen_sig: str = "",
-) -> tuple[bool, str]:
+    username: str = "",
+) -> tuple[bool, str, str]:
     """
-    Returns (should_ban: bool, reason: str).
+    Returns (should_ban: bool, reason: str, detail: str).
     Bans only when multiple independent signals correlate to the SAME other
     account. Any single matching signal alone is logged for admin review,
-    never auto-banned.
+    never auto-banned. `detail` carries the matched_uid/categories/score info
+    (plus the flagged user's own @username, when known) so the admin fraud
+    log can show exactly who a ban correlated with.
     """
+    uname_tag = f"flagged_username=@{username}" if username else "flagged_username=none"
 
     # ── 1. Self-referral ──────────────────────────────────────────────────
     if referrer_id and referrer_id == new_user_id:
-        return True, "self_invite"
+        return True, "self_invite", f"referrer_id={referrer_id} {uname_tag}"
 
     ip_ok = bool(client_ip) and client_ip not in ("127.0.0.1", "::1", "unknown")
     fp_ok = bool(fingerprint) and fingerprint not in ("undefined", "null", "")
@@ -1433,7 +1584,10 @@ async def evaluate_clone_risk(
                 f"[FRAUD] Correlated clone: new_uid={new_user_id} matches "
                 f"uid={best_uid} on {best_matched} (score={best_score})"
             )
-            return True, "correlated_clone"
+            return True, "correlated_clone", (
+                f"matches_uid={best_uid} categories={best_matched} "
+                f"score={best_score} {uname_tag}"
+            )
         elif best_score >= 1:
             logger.warning(
                 f"[FRAUD-WARN] Partial signal match (not banning): "
@@ -1441,14 +1595,15 @@ async def evaluate_clone_risk(
             )
             await DataEngine.log_fraud_attempt(
                 new_user_id, "partial_signal_match", client_ip,
-                f"matches_uid={best_uid} categories={best_matched} score={best_score}"
+                f"matches_uid={best_uid} categories={best_matched} score={best_score} {uname_tag}"
             )
 
     # ── 3. Referrer device check ────────────────────────────────────────
-    #    Needs fingerprint match PLUS (IP or hardware) match against the
-    #    referrer specifically — a single matching signal with the referrer
-    #    alone (e.g. just sharing IP, just sharing fingerprint) is normal
-    #    for family/friends and is only logged.
+    #    Weighted score ≥ 3 against the referrer specifically (fingerprint=2,
+    #    ip=1, hardware=1) — needs the strong fingerprint signal plus one
+    #    more, since ip+hardware alone (=2, no fingerprint match) isn't
+    #    enough. A single matching signal alone (e.g. just sharing IP, just
+    #    sharing hardware) is normal for family/friends and is only logged.
     if referrer_id and (fp_ok or ip_ok or hw_ok):
         async with aiosqlite.connect(DB_PATH) as db:
             db.row_factory = aiosqlite.Row
@@ -1470,10 +1625,28 @@ async def evaluate_clone_risk(
                     and inv_row["webgl_hash"] == webgl_hash
                 )
 
-                ref_score = sum([fp_matches_ref, ip_matches_ref, hw_matches_ref])
+                ref_score = (
+                    (WEIGHT_FINGERPRINT if fp_matches_ref else 0)
+                    + (WEIGHT_IP if ip_matches_ref else 0)
+                    + (WEIGHT_HARDWARE if hw_matches_ref else 0)
+                )
 
-                if fp_matches_ref and (ip_matches_ref or hw_matches_ref):
-                    return True, "same_device_as_referrer"
+                # Weighted like the main correlation check above: fingerprint
+                # counts double since it's far more unique than IP or
+                # hardware alone. Threshold 3 means either fingerprint +
+                # one more signal, or all three weaker signals combined
+                # (ip+hw alone = 2, not enough — two unrelated people on the
+                # same phone model + shared network shouldn't auto-ban).
+                if ref_score >= 3:
+                    logger.warning(
+                        f"[FRAUD] Multi-signal match with referrer — banning: "
+                        f"ref={referrer_id} new={new_user_id} "
+                        f"fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref} score={ref_score}"
+                    )
+                    return True, "same_device_as_referrer", (
+                        f"referrer={referrer_id} fp={fp_matches_ref} "
+                        f"ip={ip_matches_ref} hw={hw_matches_ref} score={ref_score} {uname_tag}"
+                    )
                 elif ref_score >= 1:
                     logger.warning(
                         f"[FRAUD-WARN] Single-signal match with referrer (not banning): "
@@ -1482,7 +1655,7 @@ async def evaluate_clone_risk(
                     )
                     await DataEngine.log_fraud_attempt(
                         new_user_id, "referrer_signal_match", client_ip,
-                        f"referrer={referrer_id} fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref}"
+                        f"referrer={referrer_id} fp={fp_matches_ref} ip={ip_matches_ref} hw={hw_matches_ref} {uname_tag}"
                     )
 
     # ── 4. IP farm detection — aware of shared-NAT / CGNAT networks ───────
@@ -1504,12 +1677,12 @@ async def evaluate_clone_risk(
             )
             await DataEngine.log_fraud_attempt(
                 new_user_id, "high_ip_usage", client_ip,
-                f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f}"
+                f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f} {uname_tag}"
             )
             if ip_count >= MAX_USERS_PER_IP_BAN and fp_ratio < IP_FARM_MIN_FP_RATIO:
-                return True, "ip_farm"
+                return True, "ip_farm", f"users={ip_count} distinct_fp={distinct_fp} ratio={fp_ratio:.2f} {uname_tag}"
 
-    return False, ""
+    return False, "", ""
 
 
 def extract_real_ip(request: Request) -> str:
@@ -1993,40 +2166,174 @@ async def notify_user_limit_reached(user_id: int):
     except Exception as e:
         logger.warning(f"Failed to send limit notification to {user_id}: {e}")
 
+async def send_ads_limit_reset_reminder(user_id: int) -> bool:
+    """For users who HIT their daily ad-watch limit yesterday — tells them
+    the limit has reset and invites them back to watch more.
+    Returns True if delivered, False if the send failed (e.g. user
+    blocked the bot)."""
+    try:
+        text = (
+            "🎉 <b>Daily Limit Reset!</b>\n\n"
+            "You watched ads yesterday! Your limit has reset for today 🚀\n"
+            "Come back and watch more ads to earn money!"
+        )
+        await bot.send_message(
+            user_id, text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎬 Watch Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={user_id}"))
+            ]])
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send ads-reset reminder to {user_id}: {e}")
+        return False
+
+
+async def send_ads_start_earning_reminder(user_id: int) -> bool:
+    """For users who watched ZERO ads yesterday — a different message
+    inviting them to start watching ads to earn, rather than implying
+    they're returning to something they already do.
+    Returns True if delivered, False if the send failed."""
+    try:
+        text = (
+            "💰 <b>A Chance to Earn Money is Waiting!</b>\n\n"
+            "You can easily earn money by watching ads.\n"
+            "Open now and start earning! 🎬"
+        )
+        await bot.send_message(
+            user_id, text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🎬 Watch Ads", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={user_id}"))
+            ]])
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to send ads-start-earning reminder to {user_id}: {e}")
+        return False
+
+
+# Ethiopian "morning" window this broadcast fires within — roughly
+# ጥዋት 1 ሰዓት to ጥዋት 3 ሰዓት (07:00–09:00 EAT). Ethiopian clocks start
+# counting from dawn (~06:00 EAT = 0/12 o'clock). EAT is UTC+3 year-round
+# (no DST), so that's a fixed 04:00–06:00 UTC window.
+ADS_RESET_WINDOW_START_UTC_MINUTE = 4 * 60   # 04:00 UTC = 07:00 EAT
+ADS_RESET_WINDOW_END_UTC_MINUTE   = 6 * 60   # 06:00 UTC = 09:00 EAT
+
+
 async def notify_ad_limit_reset_loop():
+    """Runs once a day at a RANDOM time inside the Ethiopian-morning window
+    (07:00–09:00 EAT) — a new random minute is picked each day so the send
+    time isn't identical every day. Can be turned off entirely from the
+    bot-chat admin panel (⚙️ Admin → 🔔 Ads Reset Broadcast) via the
+    'ads_reset_broadcast_enabled' setting.
+
+    Two separate audiences, each notified once per run:
+      • Hit yesterday's daily ad-watch limit  -> 'limit reset, come back'
+      • Watched zero ads yesterday (but seen recently, not banned)
+                                               -> 'start watching, earn money'
+    daily_notify_log still guards against a duplicate send on the same
+    day (e.g. if the process restarts shortly after a run).
+    """
     while True:
         try:
-            await asyncio.sleep(3600 * 6)
+            now = datetime.utcnow()
+            random_minute = random.randint(
+                ADS_RESET_WINDOW_START_UTC_MINUTE, ADS_RESET_WINDOW_END_UTC_MINUTE
+            )
+            target = now.replace(hour=0, minute=0, second=0, microsecond=0) \
+                + timedelta(minutes=random_minute)
+            if target <= now:
+                target += timedelta(days=1)
+            await asyncio.sleep((target - now).total_seconds())
+
+            broadcast_enabled = (await DataEngine.get_setting("ads_reset_broadcast_enabled", "1")) == "1"
+            if not broadcast_enabled:
+                continue
+            ads_enabled = (await DataEngine.get_setting("ads_enabled", "0")) == "1"
+            if not ads_enabled:
+                continue
+            ad_daily_limit = int(await DataEngine.get_setting("ad_daily_limit", "10"))
+
             async with aiosqlite.connect(DB_PATH) as db:
                 db.row_factory = aiosqlite.Row
+
+                # Group 1: hit the daily limit yesterday
                 cur = await db.execute(
-                    "SELECT DISTINCT user_id FROM ad_events WHERE date(completed_at) = date('now', '-1 day')"
+                    "SELECT user_id, COUNT(*) c FROM ad_events "
+                    "WHERE kind=? AND status='completed' AND date(completed_at)=date('now','-1 day') "
+                    "GROUP BY user_id HAVING c >= ?",
+                    (AD_KIND_VIDEO, ad_daily_limit),
                 )
-                users = await cur.fetchall()
-                for row in users:
-                    uid = row["user_id"]
-                    today_count = await DataEngine.count_ad_events_today(uid, AD_KIND_VIDEO)
-                    if today_count == 0:
-                        try:
-                            text = (
-                                "🎉 **Daily Limit Reset!**\n\n"
-                                "Dear user, your 24-hour ad viewing limit has been reset. You can now watch new ads and earn rewards again! 🚀\n\n"
-                                "Open the Mini App now to start earning:"
-                            )
-                            await bot.send_message(
-                                uid,
-                                text,
-                                parse_mode="Markdown",
-                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                                    InlineKeyboardButton(text="🎬 Watch Ads Now", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))
-                                ]])
-                            )
-                            await asyncio.sleep(0.3)
-                        except Exception:
-                            pass
+                limit_reached_users = [r["user_id"] for r in await cur.fetchall()]
+
+                # Group 2: zero ads watched yesterday, but active recently
+                # (last 30 days) and not banned — avoids blasting long-dead
+                # accounts that never engage with ads at all.
+                cur2 = await db.execute(
+                    "SELECT user_id FROM users WHERE is_banned=0 "
+                    "AND date(last_seen) >= date('now', '-30 day') "
+                    "AND user_id NOT IN ("
+                    "  SELECT DISTINCT user_id FROM ad_events WHERE kind=? AND status='completed' "
+                    "  AND date(completed_at)=date('now','-1 day')"
+                    ")",
+                    (AD_KIND_VIDEO,),
+                )
+                inactive_users = [r["user_id"] for r in await cur2.fetchall()]
+
+            sent_limit, failed_limit, skipped_limit = 0, 0, 0
+            for uid in limit_reached_users:
+                if await DataEngine.mark_notified_today(uid, "ads_reset_limit"):
+                    ok = await send_ads_limit_reset_reminder(uid)
+                    sent_limit += 1 if ok else 0
+                    failed_limit += 0 if ok else 1
+                    await asyncio.sleep(0.3)
+                else:
+                    skipped_limit += 1
+
+            sent_earn, failed_earn, skipped_earn = 0, 0, 0
+            for uid in inactive_users:
+                if await DataEngine.mark_notified_today(uid, "ads_start_earn"):
+                    ok = await send_ads_start_earning_reminder(uid)
+                    sent_earn += 1 if ok else 0
+                    failed_earn += 0 if ok else 1
+                    await asyncio.sleep(0.3)
+                else:
+                    skipped_earn += 1
+
+            await report_ads_reset_broadcast_to_admins(
+                sent_limit, failed_limit, skipped_limit,
+                sent_earn, failed_earn, skipped_earn,
+            )
+
         except Exception as e:
             logger.warning(f"notify_ad_limit_reset_loop error: {e}")
-        await asyncio.sleep(3600 * 6)
+
+
+async def report_ads_reset_broadcast_to_admins(
+    sent_limit: int, failed_limit: int, skipped_limit: int,
+    sent_earn: int, failed_earn: int, skipped_earn: int,
+):
+    """Sends a short delivery summary to every configured admin after each
+    daily ads-reset broadcast run, so admins know how many users actually
+    got each message without checking logs."""
+    total_sent = sent_limit + sent_earn
+    total_failed = failed_limit + failed_earn
+    text = (
+        "🔔 <b>Ads Reset Broadcast — Delivery Report</b>\n\n"
+        "🎉 <b>Limit Reset</b> (watched ads yesterday, hit limit):\n"
+        f"   ✅ Delivered: {sent_limit}\n"
+        f"   ❌ Failed: {failed_limit}\n\n"
+        "💰 <b>Start Earning</b> (watched 0 ads yesterday):\n"
+        f"   ✅ Delivered: {sent_earn}\n"
+        f"   ❌ Failed: {failed_earn}\n\n"
+        f"📊 <b>Total delivered:</b> {total_sent}\n"
+        f"📊 <b>Total failed:</b> {total_failed}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, parse_mode="HTML")
+        except Exception as e:
+            logger.warning(f"Failed to send ads-broadcast report to admin {admin_id}: {e}")
 
 def generate_verification_widget(user_id: int, ref: int, msg_id: int = 0):
     # index.html (verify screen) is served from the FRONTEND (Vercel), NOT
@@ -2085,6 +2392,7 @@ def generate_admin_dashboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📥 Pending Withdrawals", callback_data="adm_cmd_pending_tickets"),
             InlineKeyboardButton(text="📢 Broadcast Message",   callback_data="adm_cmd_broadcast"),
         ],
+        [InlineKeyboardButton(text="🔔 Ads Reset Broadcast",    callback_data="adm_cmd_ads_reset_menu")],
         [InlineKeyboardButton(text="🔍 Search User",            callback_data="adm_cmd_search")],
         [InlineKeyboardButton(text="⚠️ Fraud Log",              callback_data="adm_cmd_fraud_log")],
         [
@@ -2192,15 +2500,30 @@ async def process_account_title(message: Message, state: FSMContext):
     )
     await state.set_state(UserWithdrawalWorkflow.payout_final_approval)
 
-async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phone: str) -> dict:
+async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phone: str, method: str = "telebirr") -> dict:
     """
     Shared withdrawal-submission logic used by BOTH the bot-chat flow and
     the Mini App REST endpoint (/api/withdraw), so there's exactly one
     place that creates the ledger row and notifies admins.
+
+    `phone` holds the payout identifier — a phone number for Telebirr,
+    or a Binance ID/UID when method == "binance".
     """
-    tid, ok = await DataEngine.create_withdrawal_atomic(uid, amount, full_name, phone)
+    min_ads_req = _safe_int(await DataEngine.get_setting("min_ads_for_withdrawal", "30"), 30)
+    if min_ads_req > 0:
+        total_ads = await DataEngine.count_total_completed_ads(uid)
+        if total_ads < min_ads_req:
+            return {
+                "status": "error",
+                "reason": f"⚠️ To complete your withdrawal request, you must watch at least {min_ads_req} ads first. You have currently watched {total_ads}/{min_ads_req} ads. Please watch more ads and try again!"
+            }
+
+    tid, ok = await DataEngine.create_withdrawal_atomic(uid, amount, full_name, phone, method)
     if not ok:
         return {"status": "error", "reason": "insufficient_funds"}
+
+    is_binance = method == "binance"
+    method_label = "Binance" if is_binance else "Telebirr Portal"
 
     user = await DataEngine.get_user(uid)
     me   = await bot.get_me()
@@ -2218,7 +2541,7 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
                 f"👤 <b>Account Holder Name:</b> {sanitize_html(full_name)}\n\n"
                 f"🆔 <b>User ID:</b> <code>{uid}</code>\n\n"
                 f"💰 <b>Requested Amount:</b> ETB {amount:.2f}\n\n"
-                f"📱 <b>Method:</b> Telebirr Portal\n\n"
+                f"📱 <b>Method:</b> {method_label}\n\n"
                 f"📊 <b>Status:</b> Pending Verification ⏳\n\n"
                 f"⏰ <b>Timestamp:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
@@ -2231,13 +2554,15 @@ async def dispatch_withdrawal_core(uid: int, amount: float, full_name: str, phon
 
     direct_ref, tier2_ref = await DataEngine.get_referral_metrics(uid)
     alias_str  = f"@{sanitize_html(user['username'])}" if user["username"] else "None"
+    identifier_label = "Binance ID" if is_binance else "Phone"
     admin_txt = (
         f"📥 <b>Incoming Ticket #{tid}</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"👤 <b>Holder Name:</b> {sanitize_html(full_name)}\n"
         f"🆔 <b>User ID:</b> <code>{uid}</code>\n"
         f"👤 <b>Username:</b> {alias_str}\n"
-        f"📲 <b>Phone:</b> <code>{sanitize_html(phone)}</code>\n"
+        f"💳 <b>{identifier_label}:</b> <code>{sanitize_html(phone)}</code>\n"
+        f"📱 <b>Method:</b> {method_label}\n"
         f"💰 <b>Amount:</b> <b>{amount:.2f} Birr</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>NETWORK INTEGRITY REPORT:</b>\n"
@@ -2274,7 +2599,19 @@ async def process_payout_dispatch(callback: CallbackQuery, state: FSMContext):
         uid, s["validated_volume"], s["validated_title"], s["validated_phone"]
     )
     if result["status"] == "error":
-        return await callback.answer("❌ Insufficient funds.", show_alert=True)
+        reason = result.get("reason", "❌ Insufficient funds.")
+        if "30 ads" in reason:
+            await state.clear()
+            return await callback.message.edit_text(
+                f"{reason}\n\n👇 <b>Tap below to open the Mini App and watch your required ads:</b>",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎬 Watch Ads in Mini App", web_app=WebAppInfo(url=f"{FRONTEND_URL}/app.html?uid={uid}"))],
+                    [InlineKeyboardButton(text="🔙 Back / ተመለስ", callback_data="ui_return_home")]
+                ])
+            )
+        if reason == "insufficient_funds":
+            reason = "❌ Insufficient funds."
+        return await callback.answer(reason, show_alert=True)
 
     await state.clear()
     await callback.message.edit_text(
@@ -2327,12 +2664,69 @@ async def process_fraud_log(callback: CallbackQuery):
         return await callback.message.edit_text(
             "📭 No fraud attempts logged.", reply_markup=generate_fallback_navigation("ui_admin_core")
         )
+
+    # Collect every user_id we'll need a username for: the flagged user on
+    # each row, plus any "matches_uid=<id>" referenced inside details.
+    ids_needed = set()
+    matched_uid_by_row = {}
+    for r in rows:
+        ids_needed.add(r["user_id"])
+        details = r["details"] or ""
+        if "matches_uid=" in details:
+            token = details.split("matches_uid=", 1)[1].split(" ", 1)[0].strip()
+            if token.isdigit():
+                matched_uid = int(token)
+                matched_uid_by_row[r["id"]] = matched_uid
+                ids_needed.add(matched_uid)
+
+    usernames = {}
+    if ids_needed:
+        placeholders = ",".join("?" for _ in ids_needed)
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                f"SELECT user_id, username FROM users WHERE user_id IN ({placeholders})",
+                tuple(ids_needed),
+            )
+            for u in await cur.fetchall():
+                usernames[u["user_id"]] = u["username"]
+
+    def _uname(user_id: int) -> str:
+        uname = usernames.get(user_id)
+        return f"@{uname}" if uname else "no username"
+
+    def _flagged_uname(details: str, user_id: int) -> str:
+        # Newer rows carry "flagged_username=@x" / "flagged_username=none"
+        # straight from Telegram's initData at the moment of the attempt —
+        # prefer that (it's known even if the user was blocked before ever
+        # getting a `users` row). Fall back to the DB lookup for older rows.
+        if "flagged_username=" in details:
+            token = details.split("flagged_username=", 1)[1].split(" ", 1)[0].strip()
+            if token and token != "none":
+                return token if token.startswith("@") else f"@{token}"
+            return "no username"
+        return _uname(user_id)
+
     lines = []
     for r in rows:
+        details = r["details"] or ""
+        flagged_display = _flagged_uname(details, r["user_id"])
+        # Drop the raw tag from the body since it's now shown in the header.
+        if "flagged_username=" in details:
+            before, _, after_tag = details.partition("flagged_username=")
+            rest = after_tag.split(" ", 1)
+            remainder = rest[1] if len(rest) > 1 else ""
+            details = (before.strip() + " " + remainder.strip()).strip()
+        matched_uid = matched_uid_by_row.get(r["id"])
+        if matched_uid:
+            details = details.replace(
+                f"matches_uid={matched_uid}",
+                f"matches_uid={matched_uid} ({_uname(matched_uid)})",
+            )
         lines.append(
             f"⚠️ <code>{r['reason']}</code>\n"
-            f"   uid=<code>{r['user_id']}</code> ip=<code>{r['ip_address']}</code>\n"
-            f"   {r['details']}\n"
+            f"   uid=<code>{r['user_id']}</code> ({flagged_display}) ip=<code>{r['ip_address']}</code>\n"
+            f"   {details}\n"
             f"   🕐 {r['logged_at']}"
         )
     await callback.message.edit_text(
@@ -2358,6 +2752,8 @@ async def approve_withdrawal_core(tid: int, notify_mode: str = "both") -> dict:
     if not ticket or ticket["status"] != "pending":
         return {"ok": False, "reason": "already_processed"}
     await DataEngine.update_withdrawal_status(tid, "approved", ticket["channel_post_id"])
+    is_binance = ticket["method"] == "binance"
+    method_label = "Binance" if is_binance else "Telebirr"
     me = await bot.get_me()
     proof_channel_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Invite Now", url=f"https://t.me/{me.username}")
@@ -2369,19 +2765,12 @@ async def approve_withdrawal_core(tid: int, notify_mode: str = "both") -> dict:
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"👤 <b>Recipient:</b> {sanitize_html(ticket['full_name'])}\n\n"
             f"💰 <b>Amount:</b> ETB {ticket['amount']:.2f}\n\n"
+            f"📱 <b>Method:</b> {method_label}\n\n"
             f"🚀 <b>Operational Registry:</b> Success ✅\n\n"
             f"━━━━━━━━━━━━━━━━━━━━━━"
         )
-        try:
-            await bot.send_photo(
-                chat_id=PAYMENT_LOG_CHANNEL,
-                photo=TELEBIRR_PROOF_IMAGE,
-                caption=txt,
-                reply_to_message_id=ticket["channel_post_id"],
-                reply_markup=proof_channel_keyboard
-            )
-        except Exception as e:
-            logger.error(f"Proof Photo Error: {e}")
+        if is_binance:
+            # No Telebirr screenshot for Binance payouts — text confirmation only.
             try:
                 await bot.send_message(
                     chat_id=PAYMENT_LOG_CHANNEL,
@@ -2389,13 +2778,33 @@ async def approve_withdrawal_core(tid: int, notify_mode: str = "both") -> dict:
                     reply_to_message_id=ticket["channel_post_id"],
                     reply_markup=proof_channel_keyboard
                 )
-            except Exception as e2:
-                logger.error(f"Proof Text Fallback Error: {e2}")
+            except Exception as e:
+                logger.error(f"Binance Proof Text Error: {e}")
+        else:
+            try:
+                await bot.send_photo(
+                    chat_id=PAYMENT_LOG_CHANNEL,
+                    photo=TELEBIRR_PROOF_IMAGE,
+                    caption=txt,
+                    reply_to_message_id=ticket["channel_post_id"],
+                    reply_markup=proof_channel_keyboard
+                )
+            except Exception as e:
+                logger.error(f"Proof Photo Error: {e}")
+                try:
+                    await bot.send_message(
+                        chat_id=PAYMENT_LOG_CHANNEL,
+                        text=txt,
+                        reply_to_message_id=ticket["channel_post_id"],
+                        reply_markup=proof_channel_keyboard
+                    )
+                except Exception as e2:
+                    logger.error(f"Proof Text Fallback Error: {e2}")
     if notify_mode != "channel_only":
         try:
             await bot.send_message(
                 ticket["user_id"],
-                f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via Telebirr!"
+                f"🎉 Your cashout of {ticket['amount']:.2f} Birr has been approved and sent via {method_label}!"
             )
         except Exception:
             pass
@@ -2617,6 +3026,49 @@ async def process_rm_channel_action(callback: CallbackQuery):
         await db.execute("DELETE FROM force_channels WHERE id = ?", (row_id,))
         await db.commit()
     await callback.message.edit_text("✅ Channel removed.", reply_markup=generate_admin_dashboard())
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADMIN — ADS RESET BROADCAST TOGGLE (bot-chat panel)
+#
+# Lets the admin enable/disable the daily 'ads limit reset' / 'start
+# earning' notification broadcast (notify_ad_limit_reset_loop) without
+# touching ads_enabled itself — so ads can stay on for users while the
+# daily reminder broadcast is paused, or vice versa.
+# ─────────────────────────────────────────────────────────────────────────────
+@core_router.callback_query(F.data == "adm_cmd_ads_reset_menu")
+async def show_ads_reset_broadcast_menu(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    enabled = (await DataEngine.get_setting("ads_reset_broadcast_enabled", "1")) == "1"
+    status_line = "✅ Currently: <b>Enabled</b>" if enabled else "🚫 Currently: <b>Disabled</b>"
+    await callback.message.edit_text(
+        "🔔 <b>Ads Reset Broadcast</b>\n\n"
+        "Sends a daily message to users, once a day at a random time in "
+        "the Ethiopian morning window (07:00–09:00 EAT):\n"
+        "• Watched ads yesterday & hit the limit → 'limit reset, come back'\n"
+        "• Watched zero ads yesterday → 'start watching, earn money'\n\n"
+        f"{status_line}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Enable",  callback_data="adm_ads_reset_enable")],
+            [InlineKeyboardButton(text="🚫 Disable", callback_data="adm_ads_reset_disable")],
+            [InlineKeyboardButton(text="🔙 Back", callback_data="ui_admin_core")],
+        ])
+    )
+
+@core_router.callback_query(F.data == "adm_ads_reset_enable")
+async def enable_ads_reset_broadcast(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await DataEngine.set_setting("ads_reset_broadcast_enabled", "1")
+    await callback.answer("✅ Ads reset broadcast enabled")
+    await show_ads_reset_broadcast_menu(callback)
+
+@core_router.callback_query(F.data == "adm_ads_reset_disable")
+async def disable_ads_reset_broadcast(callback: CallbackQuery):
+    if not evaluate_admin_access(callback.from_user.id): return
+    await DataEngine.set_setting("ads_reset_broadcast_enabled", "0")
+    await callback.answer("🚫 Ads reset broadcast disabled")
+    await show_ads_reset_broadcast_menu(callback)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ADMIN — STOP / RESUME BOT ENGINE
@@ -2866,27 +3318,56 @@ async def process_broadcast_button_prompt(message: Message, state: FSMContext):
         [InlineKeyboardButton(text="🎬 Watch Ads Now", callback_data="bc_btn_watch")],
         [InlineKeyboardButton(text="🎁 Invite & Earn Rewards", callback_data="bc_btn_invite")],
         [InlineKeyboardButton(text="🎯 Complete Tasks & Earn", callback_data="bc_btn_tasks")],
+        [InlineKeyboardButton(text="🎁 Claim Daily Bonus", callback_data="bc_btn_daily")],
         [InlineKeyboardButton(text="📱 Open Mini App", callback_data="bc_btn_app")],
         [InlineKeyboardButton(text="❌ Cancel", callback_data="ui_admin_core")]
     ])
     await message.answer("🔘 <b>Select Inline Button Title & Emoji for Broadcast:</b>", reply_markup=markup)
 
+# Free-for-everyone Telegram message effects (id -> label). These only play
+# in 1-on-1 chats — Telegram ignores message_effect_id in groups/channels.
+BROADCAST_EFFECTS = {
+    "none":    (None, "🚫 No Effect"),
+    "fire":    ("5104841245755180586", "🔥 Fire"),
+    "like":    ("5107584321108051014", "👍 Thumbs Up"),
+    "dislike": ("5104858069142078462", "👎 Thumbs Down"),
+    "heart":   ("5159385139981059251", "❤️ Heart"),
+    "party":   ("5046509860389126442", "🎉 Confetti"),
+    "poop":    ("5046589136895476101", "💩 Poop"),
+}
+
 @core_router.callback_query(F.data.startswith("bc_btn_"))
-async def process_broadcast_preview(callback: CallbackQuery, state: FSMContext):
+async def process_broadcast_effect_prompt(callback: CallbackQuery, state: FSMContext):
     if not evaluate_admin_access(callback.from_user.id): return
     action = callback.data
     btn_map = {
         "bc_btn_watch": "🎬 Watch Ads Now",
         "bc_btn_invite": "🎁 Invite & Earn Rewards",
         "bc_btn_tasks": "🎯 Complete Tasks & Earn",
+        "bc_btn_daily": "🎁 Claim Daily Bonus",
         "bc_btn_app": "📱 Open Mini App"
     }
     btn_text = btn_map.get(action, "📱 Open Mini App")
     await state.update_data(bc_btn_text=btn_text)
-    
+
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"bc_fx_{key}")] for key, (_, label) in BROADCAST_EFFECTS.items()]
+    rows.append([InlineKeyboardButton(text="❌ Cancel", callback_data="ui_admin_core")])
+    await callback.message.edit_text(
+        "✨ <b>Pick a chat-open effect</b> (plays when the user opens this message — 1-on-1 chats only):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+
+@core_router.callback_query(F.data.startswith("bc_fx_"))
+async def process_broadcast_preview(callback: CallbackQuery, state: FSMContext):
+    if not evaluate_admin_access(callback.from_user.id): return
+    key = callback.data.removeprefix("bc_fx_")
+    effect_id, effect_label = BROADCAST_EFFECTS.get(key, (None, "🚫 No Effect"))
+    await state.update_data(bc_effect_id=effect_id, bc_effect_label=effect_label)
+
     data = await state.get_data()
     text = data.get("bc_payload", "")
-    
+    btn_text = data.get("bc_btn_text", "📱 Open Mini App")
+
     await state.set_state(AdminConsoleWorkflow.broadcast_confirmation)
     
     # Generate preview markup
@@ -2897,7 +3378,10 @@ async def process_broadcast_preview(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="✍️ Restart Broadcast", callback_data="adm_cmd_broadcast")],
         [InlineKeyboardButton(text="❌ Cancel", callback_data="ui_admin_core")],
     ])
-    await callback.message.edit_text(f"📝 <b>Broadcast Preview:</b>\n\n{text}\n\n🔘 <i>Button: {btn_text}</i>\n\n⚠️ Send to all users?", reply_markup=markup)
+    await callback.message.edit_text(
+        f"📝 <b>Broadcast Preview:</b>\n\n{text}\n\n🔘 <i>Button: {btn_text}</i>\n✨ <i>Effect: {effect_label}</i>\n\n⚠️ Send to all users?",
+        reply_markup=markup
+    )
 
 
 @core_router.callback_query(F.data == "bc_action_confirm", AdminConsoleWorkflow.broadcast_confirmation)
@@ -2905,6 +3389,7 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
     s    = await state.get_data()
     text = s["bc_payload"]
     btn_text = s.get("bc_btn_text", "📱 Open Mini App")
+    effect_id = s.get("bc_effect_id")
     await state.clear()
     progress = await callback.message.edit_text("⏳ Sending broadcast with custom button...")
     
@@ -2920,7 +3405,15 @@ async def process_broadcast_execute(callback: CallbackQuery, state: FSMContext):
             markup = InlineKeyboardMarkup(inline_keyboard=[[
                 InlineKeyboardButton(text=btn_text, web_app=WebAppInfo(url=url))
             ]])
-            await bot.send_message(uid, text, reply_markup=markup)
+            try:
+                if effect_id:
+                    await bot.send_message(uid, text, reply_markup=markup, message_effect_id=effect_id)
+                else:
+                    await bot.send_message(uid, text, reply_markup=markup)
+            except TypeError:
+                # Installed aiogram version predates message_effect_id support —
+                # fall back to sending without the effect rather than failing.
+                await bot.send_message(uid, text, reply_markup=markup)
             sent_count += 1
             await asyncio.sleep(0.05)
         except Exception as e:
@@ -3250,20 +3743,27 @@ async def api_verify(body: VerifyRequest, request: Request):
     if not fp_ok:
         return {"status": "blocked", "reason": "no_fingerprint"}
 
+    flagged_username = tg_user.get("username", "") or ""
+
     if await DataEngine.is_ip_banned(client_ip):
-        await DataEngine.log_fraud_attempt(uid, "banned_ip_attempt", client_ip)
+        await DataEngine.log_fraud_attempt(
+            uid, "banned_ip_attempt", client_ip,
+            f"flagged_username=@{flagged_username}" if flagged_username else "flagged_username=none"
+        )
         return {"status": "blocked", "reason": "banned_ip"}
 
     if await execute_network_vpn_lookup(client_ip):
         return {"status": "blocked", "reason": "vpn"}
 
-    should_ban, reason = await evaluate_clone_risk(
+    should_ban, reason, ban_detail = await evaluate_clone_risk(
         uid, ref, client_ip, body.fingerprint,
         body.tgPlatform, body.tgVersion, body.tgAppVersion,
         body.canvasHash, body.webglHash, body.screenSig,
+        flagged_username,
     )
     if should_ban:
-        await DataEngine.log_fraud_attempt(uid, reason, client_ip, "auto-blocked at verification")
+        detail = f"{ban_detail} — auto-blocked at verification" if ban_detail else "auto-blocked at verification"
+        await DataEngine.log_fraud_attempt(uid, reason, client_ip, detail)
         if reason == "ip_farm":
             await DataEngine.ban_ip(client_ip, reason)
         return {"status": "blocked", "reason": reason}
@@ -3349,6 +3849,8 @@ async def api_me(body: ApiBase):
     direct, tier2 = await DataEngine.get_paid_referral_metrics(user["user_id"])
     rate = float(await DataEngine.get_setting("reward_per_referral", "10"))
     min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    min_w_binance = float(await DataEngine.get_setting("min_withdrawal_binance", "50"))
+    usdt_rate = float(await DataEngine.get_setting("usdt_to_birr_rate", "130"))
     uname = BOT_USERNAME or (await bot.get_me()).username
     return {
         "user_id": user["user_id"],
@@ -3357,6 +3859,8 @@ async def api_me(body: ApiBase):
         "tier2_referrals": tier2,
         "reward_per_referral": rate,
         "min_withdrawal": min_w,
+        "min_withdrawal_binance": min_w_binance,
+        "usdt_to_birr_rate": usdt_rate,
         "total_earned_refs": round(direct * rate, 2),
         "referral_link": f"https://t.me/{uname}?start={user['user_id']}",
         "is_admin": evaluate_admin_access(user["user_id"]),
@@ -3488,6 +3992,12 @@ async def api_ads_status(body: ApiBase):
     monetag_zone_id = (await DataEngine.get_setting("monetag_zone_id", "") or "").strip()
     monetag_sdk_url = (await DataEngine.get_setting("monetag_sdk_url", "") or "").strip()
 
+    reminder_enabled   = (await DataEngine.get_setting("ad_click_reminder_enabled", "1")) == "1"
+    reminder_disguised = (await DataEngine.get_setting("ad_click_reminder_disguised", "0")) == "1"
+    reminder_text      = await DataEngine.get_setting("ad_click_reminder_text", "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ")
+    reminder_disguise_text = await DataEngine.get_setting("ad_click_reminder_disguise_text", "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+    reminder_network_text  = await DataEngine.get_setting("ad_click_reminder_network_text", "⚠️ Network error. Please try again.")
+
     return {
         "enabled": ads_enabled and bool(block_id or monetag_zone_id),
         "block_id": block_id,
@@ -3495,6 +4005,13 @@ async def api_ads_status(body: ApiBase):
         "daily_limit": daily_limit,
         "watched_today": watched_today,
         "seconds_left": seconds_left,
+        "click_reminder": {
+            "enabled": reminder_enabled,
+            "disguised": reminder_disguised,
+            "text": reminder_text,
+            "disguise_text": reminder_disguise_text,
+            "network_text": reminder_network_text,
+        },
         "monetag": {
             "zone_id": monetag_zone_id,
             "sdk_url": monetag_sdk_url,
@@ -3509,6 +4026,53 @@ async def api_ads_status(body: ApiBase):
             "wait_seconds": dl_wait_seconds,
         },
     }
+
+
+# ── /api/dailycheck — watch one ad, then claim a once-a-day bonus ────────
+@api_app.post("/api/dailycheck/status")
+async def api_dailycheck_status(body: ApiBase):
+    user = await _authenticate(body)
+    uid = user["user_id"]
+    enabled = (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1"
+    reward  = float(await DataEngine.get_setting("daily_checkin_reward", "5"))
+    reminder_text = await DataEngine.get_setting(
+        "daily_checkin_reminder_text", "⚠️ Couldn't confirm your ad view — try again in a moment"
+    )
+    status  = await DataEngine.get_daily_checkin_status(uid)
+    return {
+        "enabled": enabled,
+        "reward": reward,
+        "claimed_today": status["claimed_today"],
+        "streak": status["streak"],
+        "ad_watched_recently": await DataEngine.has_recent_completed_ad(uid),
+        "reminder_text": reminder_text,
+    }
+
+
+@api_app.post("/api/dailycheck/claim")
+async def api_dailycheck_claim(body: ApiBase):
+    """Requires a genuinely S2S-confirmed ad view (see
+    has_recent_completed_ad) in the last few minutes before the once-daily
+    bonus can be claimed — same trust model as the regular ad reward, so
+    this can't be claimed by just calling the API without watching
+    anything."""
+    user = await _authenticate(body)
+    uid = user["user_id"]
+
+    enabled = (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1"
+    if not enabled:
+        raise HTTPException(status_code=400, detail="disabled")
+
+    if not await DataEngine.has_recent_completed_ad(uid):
+        raise HTTPException(status_code=400, detail="watch_ad_first")
+
+    reward = float(await DataEngine.get_setting("daily_checkin_reward", "5"))
+    ok, reason, streak = await DataEngine.claim_daily_checkin_atomic(uid, reward)
+    if not ok:
+        raise HTTPException(status_code=400, detail=reason)
+
+    fresh = await DataEngine.get_user(uid)
+    return {"status": "claimed", "reward": reward, "streak": streak, "balance": float(fresh["balance"])}
 
 
 @api_app.post("/api/ads/claim")
@@ -3561,8 +4125,9 @@ async def api_ads_adsgram_reward(userid: int, secret: Optional[str] = None):
     daily_limit      = int(await DataEngine.get_setting("ad_daily_limit", "10"))
     cooldown_seconds = int(await DataEngine.get_setting("ad_cooldown_seconds", "30"))
     reward_amount    = float(await DataEngine.get_setting("ad_reward_amount", "0.5"))
+    reminder_enabled = (await DataEngine.get_setting("ad_click_reminder_enabled", "1")) == "1"
 
-    ok, _ = await DataEngine.claim_video_ad_atomic(userid, reward_amount, daily_limit, cooldown_seconds)
+    ok, _ = await DataEngine.claim_video_ad_atomic(userid, reward_amount, daily_limit, cooldown_seconds, reminder_enabled)
     return {"ok": ok}
 
 
@@ -3904,18 +4469,32 @@ async def api_tasks_cancel(body: TaskActionRequest):
 # ── /api/withdraw ─────────────────────────────────────────────────────────
 class WithdrawRequest(ApiBase):
     amount: float = Field(gt=0)
-    phone: str
+    phone: str = ""
+    binance_id: str = ""
+    method: str = "telebirr"
     full_name: str
 
 
 @api_app.post("/api/withdraw")
 async def api_withdraw(body: WithdrawRequest):
     user = await _authenticate(body)
-    min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+    method = body.method.strip().lower() if body.method.strip().lower() == "binance" else "telebirr"
+
+    if method == "binance":
+        min_w = float(await DataEngine.get_setting("min_withdrawal_binance", "50"))
+        identifier = body.binance_id.strip()
+        if not identifier:
+            raise HTTPException(status_code=400, detail="binance_id_required")
+    else:
+        min_w = float(await DataEngine.get_setting("min_withdrawal", "50"))
+        identifier = body.phone.strip()
+        if not identifier:
+            raise HTTPException(status_code=400, detail="phone_required")
+
     if body.amount < min_w:
         raise HTTPException(status_code=400, detail=f"min_withdrawal_is_{min_w:.2f}")
     result = await dispatch_withdrawal_core(
-        user["user_id"], body.amount, body.full_name.strip(), body.phone.strip()
+        user["user_id"], body.amount, body.full_name.strip(), identifier, method
     )
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["reason"])
@@ -4212,6 +4791,20 @@ async def api_admin_users_balance(body: AdminUserBalanceRequest):
     return {"ok": True}
 
 
+def _safe_int(val, default: int) -> int:
+    try:
+        return int(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(val, default: float) -> float:
+    try:
+        return float(str(val).strip())
+    except (TypeError, ValueError):
+        return default
+
+
 # ── /api/admin/settings ───────────────────────────────────────────────────
 @api_app.post("/api/admin/settings")
 async def api_admin_settings(body: ApiBase):
@@ -4219,44 +4812,71 @@ async def api_admin_settings(body: ApiBase):
     _require_admin(user)
     rate = await DataEngine.get_setting("reward_per_referral", "10")
     min_w = await DataEngine.get_setting("min_withdrawal", "50")
+    min_w_binance = await DataEngine.get_setting("min_withdrawal_binance", "50")
+    usdt_rate = await DataEngine.get_setting("usdt_to_birr_rate", "130")
+    min_ads = await DataEngine.get_setting("min_ads_for_withdrawal", "30")
     return {
-        "reward_per_referral": float(rate),
-        "min_withdrawal": float(min_w),
+        "reward_per_referral": _safe_float(rate, 10.0),
+        "min_withdrawal": _safe_float(min_w, 50.0),
+        "min_withdrawal_binance": _safe_float(min_w_binance, 50.0),
+        "usdt_to_birr_rate": _safe_float(usdt_rate, 130.0),
+        "min_ads_for_withdrawal": _safe_int(min_ads, 30),
         # AdsGram — rewarded video
         "ads_enabled": (await DataEngine.get_setting("ads_enabled", "0")) == "1",
         "adsgram_block_id": await DataEngine.get_setting("adsgram_block_id", "") or "",
-        "ad_reward_amount": float(await DataEngine.get_setting("ad_reward_amount", "0.5")),
-        "ad_daily_limit": int(await DataEngine.get_setting("ad_daily_limit", "10")),
-        "ad_cooldown_seconds": int(await DataEngine.get_setting("ad_cooldown_seconds", "30")),
+        "ad_reward_amount": _safe_float(await DataEngine.get_setting("ad_reward_amount", "0.5"), 0.5),
+        "ad_daily_limit": _safe_int(await DataEngine.get_setting("ad_daily_limit", "10"), 10),
+        "ad_cooldown_seconds": _safe_int(await DataEngine.get_setting("ad_cooldown_seconds", "30"), 30),
         # AdsGram — Direct Link
         "adsgram_direct_link": await DataEngine.get_setting("adsgram_direct_link", "") or "",
-        "direct_link_reward_amount": float(await DataEngine.get_setting("direct_link_reward_amount", "0.3")),
-        "direct_link_daily_limit": int(await DataEngine.get_setting("direct_link_daily_limit", "10")),
-        "direct_link_wait_seconds": int(await DataEngine.get_setting("direct_link_wait_seconds", "15")),
-        "direct_link_cooldown_seconds": int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30")),
+        "direct_link_reward_amount": _safe_float(await DataEngine.get_setting("direct_link_reward_amount", "0.3"), 0.3),
+        "direct_link_daily_limit": _safe_int(await DataEngine.get_setting("direct_link_daily_limit", "10"), 10),
+        "direct_link_wait_seconds": _safe_int(await DataEngine.get_setting("direct_link_wait_seconds", "15"), 15),
+        "direct_link_cooldown_seconds": _safe_int(await DataEngine.get_setting("direct_link_cooldown_seconds", "30"), 30),
         # Monetag — fallback rewarded network when AdsGram has no fill
         "monetag_zone_id": await DataEngine.get_setting("monetag_zone_id", "") or "",
         "monetag_sdk_url": await DataEngine.get_setting("monetag_sdk_url", "") or "",
         # Referral skip — silently withhold payment for some referrals
         "referral_skip_enabled": (await DataEngine.get_setting("referral_skip_enabled", "0")) == "1",
-        "referral_skip_batch_size": int(await DataEngine.get_setting("referral_skip_batch_size", "6")),
-        "referral_skip_min": int(await DataEngine.get_setting("referral_skip_min", "1")),
-        "referral_skip_max": int(await DataEngine.get_setting("referral_skip_max", "3")),
+        "referral_skip_batch_size": _safe_int(await DataEngine.get_setting("referral_skip_batch_size", "6"), 6),
+        "referral_skip_min": _safe_int(await DataEngine.get_setting("referral_skip_min", "1"), 1),
+        "referral_skip_max": _safe_int(await DataEngine.get_setting("referral_skip_max", "3"), 3),
         # User self-serve task creation (users advertise their own channel,
         # paid from their own balance)
         "user_task_creation_enabled": (await DataEngine.get_setting("user_task_creation_enabled", "0")) == "1",
-        "user_task_min_reward": float(await DataEngine.get_setting("user_task_min_reward", "1")),
-        "user_task_max_reward": float(await DataEngine.get_setting("user_task_max_reward", "20")),
-        "user_task_min_slots": int(await DataEngine.get_setting("user_task_min_slots", "5")),
-        "user_task_max_slots": int(await DataEngine.get_setting("user_task_max_slots", "500")),
+        "user_task_min_reward": _safe_float(await DataEngine.get_setting("user_task_min_reward", "1"), 1.0),
+        "user_task_max_reward": _safe_float(await DataEngine.get_setting("user_task_max_reward", "20"), 20.0),
+        "user_task_min_slots": _safe_int(await DataEngine.get_setting("user_task_min_slots", "5"), 5),
+        "user_task_max_slots": _safe_int(await DataEngine.get_setting("user_task_max_slots", "500"), 500),
         # Support contact — shown as a floating support button in the dashboard
         "support_username": (await DataEngine.get_setting("support_username", "") or "").lstrip("@"),
+        # Ad-view reward-skip reminder (the message shown when a claim is
+        # withheld by the odd/even skip pattern)
+        "ad_click_reminder_enabled": (await DataEngine.get_setting("ad_click_reminder_enabled", "1")) == "1",
+        "ad_click_reminder_disguised": (await DataEngine.get_setting("ad_click_reminder_disguised", "0")) == "1",
+        "ad_click_reminder_text": await DataEngine.get_setting(
+            "ad_click_reminder_text", "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
+        ),
+        "ad_click_reminder_disguise_text": await DataEngine.get_setting(
+            "ad_click_reminder_disguise_text", "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
+        ),
+        "ad_click_reminder_network_text": await DataEngine.get_setting(
+            "ad_click_reminder_network_text", "⚠️ Network error. Please try again."
+        ),
+        "daily_checkin_enabled": (await DataEngine.get_setting("daily_checkin_enabled", "1")) == "1",
+        "daily_checkin_reward": float(await DataEngine.get_setting("daily_checkin_reward", "5")),
+        "daily_checkin_reminder_text": await DataEngine.get_setting(
+            "daily_checkin_reminder_text", "⚠️ Couldn't confirm your ad view — try again in a moment"
+        ),
     }
 
 
 class AdminSettingsUpdateRequest(ApiBase):
     reward_per_referral: float
     min_withdrawal: float
+    min_withdrawal_binance: float = 50
+    usdt_to_birr_rate: float = 130
+    min_ads_for_withdrawal: int = 30
     ads_enabled: bool = False
     adsgram_block_id: str = ""
     ad_reward_amount: float = 0.5
@@ -4281,6 +4901,14 @@ class AdminSettingsUpdateRequest(ApiBase):
     support_username: str = ""
     ticker_enabled: bool = True
     ticker_custom_names: str = "[]"
+    ad_click_reminder_enabled: bool = True
+    ad_click_reminder_disguised: bool = False
+    ad_click_reminder_text: str = "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ"
+    ad_click_reminder_disguise_text: str = "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
+    ad_click_reminder_network_text: str = "⚠️ Network error. Please try again."
+    daily_checkin_enabled: bool = True
+    daily_checkin_reward: float = 5
+    daily_checkin_reminder_text: str = "⚠️ Couldn't confirm your ad view — try again in a moment"
 
 
 @api_app.post("/api/admin/settings/update")
@@ -4289,6 +4917,9 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     _require_admin(user)
     await DataEngine.set_setting("reward_per_referral", str(body.reward_per_referral))
     await DataEngine.set_setting("min_withdrawal", str(body.min_withdrawal))
+    await DataEngine.set_setting("min_withdrawal_binance", str(body.min_withdrawal_binance))
+    await DataEngine.set_setting("usdt_to_birr_rate", str(body.usdt_to_birr_rate))
+    await DataEngine.set_setting("min_ads_for_withdrawal", str(body.min_ads_for_withdrawal))
     await DataEngine.set_setting("ads_enabled", "1" if body.ads_enabled else "0")
     await DataEngine.set_setting("adsgram_block_id", body.adsgram_block_id.strip())
     await DataEngine.set_setting("ad_reward_amount", str(body.ad_reward_amount))
@@ -4313,6 +4944,14 @@ async def api_admin_settings_update(body: AdminSettingsUpdateRequest):
     await DataEngine.set_setting("support_username", body.support_username.strip().lstrip("@"))
     await DataEngine.set_setting("ticker_enabled", "1" if body.ticker_enabled else "0")
     await DataEngine.set_setting("ticker_custom_names", body.ticker_custom_names)
+    await DataEngine.set_setting("ad_click_reminder_enabled", "1" if body.ad_click_reminder_enabled else "0")
+    await DataEngine.set_setting("ad_click_reminder_disguised", "1" if body.ad_click_reminder_disguised else "0")
+    await DataEngine.set_setting("ad_click_reminder_text", body.ad_click_reminder_text.strip() or "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ")
+    await DataEngine.set_setting("ad_click_reminder_disguise_text", body.ad_click_reminder_disguise_text.strip() or "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+    await DataEngine.set_setting("ad_click_reminder_network_text", body.ad_click_reminder_network_text.strip() or "⚠️ Network error. Please try again.")
+    await DataEngine.set_setting("daily_checkin_enabled", "1" if body.daily_checkin_enabled else "0")
+    await DataEngine.set_setting("daily_checkin_reward", str(body.daily_checkin_reward))
+    await DataEngine.set_setting("daily_checkin_reminder_text", body.daily_checkin_reminder_text.strip() or "⚠️ Couldn't confirm your ad view — try again in a moment")
     return {"ok": True}
 
 
@@ -4424,6 +5063,7 @@ async def _main():
         logger.warning(f"Could not pre-cache bot photo at startup: {e}")
     _polling_task = asyncio.create_task(dp.start_polling(bot, skip_updates=True))
     asyncio.create_task(db_backup_loop())
+    asyncio.create_task(notify_ad_limit_reset_loop())
     await _run_web_server()
 
 
