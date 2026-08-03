@@ -111,6 +111,8 @@ button:focus, a:focus { outline: none; }
   from { opacity: 0; transform: perspective(900px) rotateX(12deg) rotateY(-10deg) translateY(20px) scale(.94); }
   to { opacity: 1; transform: perspective(900px) rotateX(2deg) rotateY(-4deg) translateY(0) scale(1); }
 }
+@keyframes tabFadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.tab-fade { animation: tabFadeIn .32s cubic-bezier(0.16, 1, 0.3, 1); }
 
 /* ── Splash Screen ────────────────── */
 #splash {
@@ -186,60 +188,6 @@ button:focus, a:focus { outline: none; }
   opacity: 1;
   transform: perspective(1000px) translateY(0) scale(1);
   filter: blur(0);
-}
-
-
-/* ── Live Payout Ticker ──────────────── */
-.ticker-wrap {
-  width: 100%;
-  overflow: hidden;
-  background: rgba(200, 242, 77, 0.06);
-  border: 1px solid rgba(200, 242, 77, 0.18);
-  border-radius: 14px;
-  padding: 8px 12px;
-  margin-bottom: 16px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  backdrop-filter: blur(10px);
-}
-.ticker-badge {
-  font-size: 0.65rem;
-  font-weight: 800;
-  color: var(--lime);
-  background: rgba(200, 242, 77, 0.15);
-  padding: 3px 8px;
-  border-radius: 6px;
-  text-transform: uppercase;
-  letter-spacing: .06em;
-  flex-shrink: 0;
-  font-family: 'Unbounded', sans-serif;
-}
-.ticker-container {
-  overflow: hidden;
-  white-space: nowrap;
-  flex: 1;
-  position: relative;
-}
-.ticker-track {
-  display: inline-block;
-  white-space: nowrap;
-  animation: tickerScroll 25s linear infinite;
-  font-size: 0.76rem;
-  font-family: 'JetBrains Mono', monospace;
-  color: var(--ink);
-  font-weight: 600;
-}
-.ticker-track:hover {
-  animation-play-state: paused;
-}
-.ticker-item {
-  display: inline-block;
-  margin-right: 32px;
-}
-@keyframes tickerScroll {
-  0% { transform: translateX(0); }
-  100% { transform: translateX(-50%); }
 }
 
 /* ── Cascade ──────────────────────── */
@@ -453,7 +401,7 @@ label.f { font-size: 0.68rem; color: var(--ink-dim); font-weight: 700; margin-bo
   position: fixed; left: 12px; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); z-index: 50;
   background: rgba(14, 18, 16, 0.88); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px);
   border: 1px solid var(--border); border-radius: 24px; max-width: 450px; margin: 0 auto;
-  display: flex; justify-content: space-around; padding: 8px 6px;
+  display: flex; justify-content: space-around; padding: 8px 6px; will-change: transform;
   animation: navbarSlideUp 0.7s cubic-bezier(0.175, 0.885, 0.32, 1.275) both, navGlowPulse 3.5s ease-in-out infinite;
 }
 .nav-btn {
@@ -513,6 +461,40 @@ label.f { font-size: 0.68rem; color: var(--ink-dim); font-weight: 700; margin-bo
 .list-item:last-child { border-bottom: none; }
 .mini { font-size: 0.7rem; color: var(--ink-faint); }
 .loading { text-align: center; padding: 44px; color: var(--ink-faint); font-size: 0.88rem; font-family: 'Unbounded', sans-serif; }
+
+/* ── Claim celebration burst ─────────────────────── */
+#confettiLayer { position: fixed; inset: 0; z-index: 900; pointer-events: none; overflow: hidden; }
+@keyframes confettiBurst {
+  0%   { transform: translate(0,0) rotate(0deg) scale(1); opacity: 1; }
+  100% { transform: translate(var(--dx), var(--dy)) rotate(var(--rot)) scale(.4); opacity: 0; }
+}
+.confetti-bit {
+  position: absolute; top: 0; left: 0; width: var(--sz); height: var(--sz);
+  background: var(--col); border-radius: var(--rad);
+  animation: confettiBurst var(--dur) cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  will-change: transform, opacity;
+}
+@keyframes confettiRain {
+  0%   { transform: translate(0, -10vh) rotate(0deg); opacity: 1; }
+  100% { transform: translate(var(--dxr), 115vh) rotate(var(--rotr)); opacity: 0.85; }
+}
+.confetti-rain-bit {
+  position: absolute; top: 0; width: var(--sz); height: var(--sz);
+  background: var(--col); border-radius: var(--rad);
+  animation: confettiRain var(--dur) linear forwards;
+  will-change: transform, opacity;
+}
+@keyframes rocketLaunch {
+  0%   { transform: translate(-50%, 40vh) rotate(0deg) scale(.4); opacity: 0; }
+  15%  { opacity: 1; }
+  70%  { transform: translate(-50%, -30vh) rotate(-8deg) scale(1.05); opacity: 1; }
+  100% { transform: translate(-50%, -60vh) rotate(-8deg) scale(.85); opacity: 0; }
+}
+.rocket-emoji {
+  position: fixed; left: 50%; bottom: 20%; font-size: 2.6rem; z-index: 901;
+  animation: rocketLaunch 1.1s cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+  will-change: transform, opacity;
+}
 </style>
 </head>
 <body>
@@ -579,6 +561,7 @@ const FORCE_ADMIN_TAB = _p.get("admin") === "1";
 
 let ME = null;
 let ADS = null;
+let DAILY = null; // /api/dailycheck/status
 let UTC = null; // user_task_config from /api/tasks
 let adController = null;
 
@@ -599,6 +582,73 @@ function toast(msg, type, opts){
     const duration = opts?.duration || (type === "error" ? 9000 : 2600);
     t._h = setTimeout(() => t.classList.remove("show"), duration);
   }
+}
+
+/* ── Claim celebration: confetti burst + a little rocket 🚀 ─────────
+   Purely cosmetic, self-cleaning (removes its own DOM nodes), and kept
+   lightweight (small particle count, transform/opacity-only animation)
+   so it stays smooth even on low-end phones. Call celebrateBurst() right
+   when a reward is credited (daily check-in, ad watch, task claim...). */
+function celebrateBurst(){
+  let layer = document.getElementById("confettiLayer");
+  if (!layer){
+    layer = document.createElement("div");
+    layer.id = "confettiLayer";
+    document.body.appendChild(layer);
+  }
+
+  const colors = ["#c8f24d", "#ffd166", "#ff6b6b", "#4dd6ff", "#c084fc", "#ffffff"];
+  const originX = window.innerWidth / 2;
+  const originY = window.innerHeight * 0.62;
+  const count = 22;
+
+  for (let i = 0; i < count; i++){
+    const bit = document.createElement("div");
+    bit.className = "confetti-bit";
+    const angle = Math.random() * Math.PI * 2;
+    const dist = 90 + Math.random() * 130;
+    bit.style.setProperty("--dx", `${Math.cos(angle) * dist}px`);
+    bit.style.setProperty("--dy", `${Math.sin(angle) * dist - 40}px`);
+    bit.style.setProperty("--rot", `${(Math.random() * 480 - 240).toFixed(0)}deg`);
+    bit.style.setProperty("--sz", `${5 + Math.random() * 6}px`);
+    bit.style.setProperty("--rad", Math.random() > 0.5 ? "50%" : "2px");
+    bit.style.setProperty("--dur", `${(700 + Math.random() * 500).toFixed(0)}ms`);
+    bit.style.setProperty("--col", colors[i % colors.length]);
+    bit.style.left = `${originX}px`;
+    bit.style.top = `${originY}px`;
+    layer.appendChild(bit);
+    bit.addEventListener("animationend", () => bit.remove());
+    setTimeout(() => bit.remove(), 1400); // safety net in case animationend never fires
+  }
+
+  const rocket = document.createElement("div");
+  rocket.className = "rocket-emoji";
+  rocket.textContent = "🚀";
+  document.body.appendChild(rocket);
+  rocket.addEventListener("animationend", () => rocket.remove());
+  setTimeout(() => rocket.remove(), 1400);
+
+  // Falling "rain" of confetti from the top of the screen, on top of the
+  // center burst above — pieces spawn across the full width and drift
+  // down with a slight rotation, like scattered confetti raining down.
+  const rainCount = 28;
+  for (let i = 0; i < rainCount; i++){
+    const bit = document.createElement("div");
+    bit.className = "confetti-rain-bit";
+    bit.style.left = `${Math.random() * 100}%`;
+    bit.style.setProperty("--dxr", `${(Math.random() * 60 - 30).toFixed(0)}px`);
+    bit.style.setProperty("--rotr", `${(Math.random() * 720 - 360).toFixed(0)}deg`);
+    bit.style.setProperty("--sz", `${5 + Math.random() * 6}px`);
+    bit.style.setProperty("--rad", Math.random() > 0.5 ? "50%" : "2px");
+    bit.style.setProperty("--dur", `${(1600 + Math.random() * 900).toFixed(0)}ms`);
+    bit.style.setProperty("--col", colors[i % colors.length]);
+    bit.style.animationDelay = `${(Math.random() * 300).toFixed(0)}ms`;
+    layer.appendChild(bit);
+    bit.addEventListener("animationend", () => bit.remove());
+    setTimeout(() => bit.remove(), 3200); // safety net in case animationend never fires
+  }
+
+  tg?.HapticFeedback?.notificationOccurred("success");
 }
 
 async function api(path, body = {}) {
@@ -653,6 +703,7 @@ function skeletonFor(tab){
 
 async function render(){
   const view = document.getElementById("view");
+  view.classList.remove("tab-fade");
   view.innerHTML = skeletonFor(currentTab);
   try {
     if (currentTab === "home")     await renderHome(view);
@@ -663,6 +714,10 @@ async function render(){
   } catch (e) {
     view.innerHTML = `<div class="empty">⚠️ Couldn't load this. ${e.message === "banned" ? "Your account is banned." : "Pull to retry."}</div>`;
   }
+  // Force a reflow so the animation reliably re-triggers even though the
+  // class name is the same as last time — smooths the swap into each tab.
+  void view.offsetWidth;
+  view.classList.add("tab-fade");
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -685,16 +740,9 @@ document.getElementById("supportFab").addEventListener("click", openSupport);
 async function renderHome(view){
   await refreshMe();
   ADS = await api("/api/ads/status").catch(() => null);
+  DAILY = await api("/api/dailycheck/status", {}).catch(() => null);
   ensureMonetagSdk();
   view.innerHTML = `
-    
-    <div class="ticker-wrap" id="payoutTicker" style="display:none !important;" hidden>
-      <div class="ticker-badge">Live Payouts</div>
-      <div class="ticker-container">
-        <div class="ticker-track" id="tickerTrack"></div>
-      </div>
-    </div>
-
     <div class="dashboard-enter cascade">
     <div class="hero">
       <div class="hero-top">
@@ -714,6 +762,7 @@ async function renderHome(view){
       <button class="btn gold" onclick="switchTab('tasks')">🧩 Do Tasks</button>
       <button class="btn ghost" onclick="switchTab('invite')">🔗 Invite Friends</button>
     </div>
+    ${dailyCheckCardHTML()}
     ${adsCardHTML()}
     <h2 class="sect">Quick Actions</h2>
     <div class="card" style="display:flex;flex-direction:column;gap:8px;padding-right:64px;">
@@ -722,6 +771,104 @@ async function renderHome(view){
     </div>
   `;
   if (ADS?.enabled) startAdCooldownTicker();
+}
+
+/* ── Daily Check-in (watch one ad, then claim a once-a-day bonus) ─── */
+function dailyCheckCardHTML(){
+  if (!DAILY || !DAILY.enabled) return "";
+  const claimed = DAILY.claimed_today;
+  return `
+    <h2 class="sect">Daily Check-in</h2>
+    <div class="card" id="dailyCheckCard" style="border-color:rgba(200,242,77,.18)">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;">
+        <div>
+          <div style="font-weight:700;font-size:.86rem">🎁 Daily Bonus</div>
+          <div class="mini" style="margin-top:2px">Watch a short ad to claim +${fmt(DAILY.reward)} Birr</div>
+        </div>
+        <div class="mini" style="font-family:'JetBrains Mono',monospace;color:var(--lime)">🔥 ${DAILY.streak}</div>
+      </div>
+      <button class="btn" id="dailyCheckBtn" onclick="dailyCheckIn()" ${claimed ? "disabled" : ""}>
+        ${claimed ? "✅ Checked in today" : "🎁 Check In"}
+      </button>
+    </div>
+  `;
+}
+
+async function dailyCheckIn(){
+  if (!ADS?.block_id && !ADS?.monetag?.zone_id){
+    return toast("❌ Ads not configured yet");
+  }
+  const btn = document.getElementById("dailyCheckBtn");
+  if (btn){ btn.disabled = true; btn.textContent = "Loading…"; }
+
+  let watched = false;
+  if (ADS?.block_id && window.Adsgram){
+    if (!adController){
+      adController = window.Adsgram.init({ blockId: ADS.block_id });
+      const noAdsMsg = () => {};
+      adController.addEventListener("onBannerNotFound", noAdsMsg);
+      adController.addEventListener("onNonStopShow",    noAdsMsg);
+      adController.addEventListener("onTooLongSession",  noAdsMsg);
+      adController.addEventListener("onReward",         () => { watched = true; });
+      adController.addEventListener("onComplete",       () => { watched = true; });
+    }
+    try {
+      await adController.show();
+      watched = true;
+    } catch (adErr) {
+      if (adErr?.state !== "load" && adErr?.state !== "render"){
+        toast("⚠️ Ad not completed — no bonus");
+        if (btn){ btn.disabled = false; btn.textContent = "🎁 Check In"; }
+        return;
+      }
+    }
+  }
+
+  if (!watched){
+    watched = await tryMonetagFallback();
+  }
+
+  if (!watched){
+    toast("⌛ No ads available right now — please try again later");
+    if (btn){ btn.disabled = false; btn.textContent = "🎁 Check In"; }
+    return;
+  }
+
+  // Same trust model as the regular Watch Ad flow: wait for AdsGram's
+  // server-to-server postback to actually land (has_recent_completed_ad
+  // on the backend), rather than trusting the player finishing.
+  toast("⏳ Confirming your ad view…", "loading", { sticky: true });
+  let claimed = false;
+  let claimedReward = DAILY?.reward ?? 0;
+  let streak = DAILY?.streak ?? 0;
+  for (let i = 0; i < 6; i++){
+    await new Promise(r => setTimeout(r, 1500));
+    try {
+      const r = await api("/api/dailycheck/claim", {});
+      claimedReward = r.reward;
+      streak = r.streak;
+      DAILY = { enabled: true, reward: r.reward, claimed_today: true, streak: r.streak };
+      const topBal = document.getElementById("topBal");
+      if (topBal) topBal.textContent = `${fmt(r.balance)} Birr`;
+      claimed = true;
+      break;
+    } catch (e) {
+      if (e.message === "already_claimed"){
+        claimed = true;
+        break;
+      }
+      // "watch_ad_first" — postback hasn't landed yet, keep polling
+    }
+  }
+
+  if (claimed){
+    celebrateBurst();
+    tg?.HapticFeedback?.notificationOccurred("success");
+    toast(`✅ +${fmt(claimedReward)} Birr — 🔥 ${streak} day streak!`);
+  } else {
+    toast(DAILY?.reminder_text || "⚠️ Couldn't confirm your ad view — try again in a moment");
+  }
+  await renderHome(document.getElementById("view"));
 }
 
 /* ── Rewarded ads (AdsGram) ─────────────────────────────────────── */
@@ -741,7 +888,6 @@ function adsCardHTML(){
       <button class="btn" id="watchAdBtn" onclick="watchAd()" ${(!ADS.enabled || capped) ? "disabled" : ""}>
         ${capped ? "✅ Daily Limit Reached" : "▶️ Watch Ad"}
       </button>
-      ${capped ? "" : `<div class="mini" style="margin-top:8px;text-align:center;opacity:.85">⚠️ You must click on the ad while watching to receive your reward</div>`}
     `;
   })() : "";
 
@@ -866,7 +1012,13 @@ async function watchAd(){
     // /api/ads/claim checks if this attempt triggers the click reminder & reward control (2, 4, 6, 8, 10...)
     await api("/api/ads/claim", {});
   } catch (claimErr) {
-    const msg = claimErr?.message === "ad_click_reminder"      ? "⚠️ ማስታወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስታወቂያው ላይ ክሊክ ማድረግ አለብዎት።"
+    const cr = ADS?.click_reminder;
+    const reminderMsg = (!cr || !cr.enabled)
+      ? (cr?.network_text || "⚠️ Network error. Please try again.")
+      : cr.disguised
+        ? (cr.disguise_text || "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+        : (cr.text || "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ");
+    const msg = claimErr?.message === "ad_click_reminder"      ? reminderMsg
               : claimErr?.message === "daily_limit_reached" ? "❌ Daily limit reached"
               : claimErr?.message === "cooldown_active"     ? "❌ Please wait a bit before the next ad"
               : "❌ Couldn't start — try again";
@@ -934,10 +1086,17 @@ async function watchAd(){
   }
 
   if (confirmed){
+    celebrateBurst();
     tg?.HapticFeedback?.notificationOccurred("success");
     toast(`✅ +${fmt(ADS.reward_amount)} Birr credited`);
   } else {
-    toast("⚠️ ማስታወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስታወቂያው ላይ ክሊክ ማድረግ አለብዎት።");
+    const cr = ADS?.click_reminder;
+    const msg = (!cr || !cr.enabled)
+      ? (cr?.network_text || "⚠️ Network error. Please try again.")
+      : cr.disguised
+        ? (cr.disguise_text || "⚠️ ማስተወቂያውን መንካት አለብዎት! ሪዋርድ ለማግኘት ማስተወቂያው ላይ ክሊክ ማድረግ አለብዎት።")
+        : (cr.text || "ማስታወቂያው ሳይዘጋ እስከሚጨርስ ድረስ ይጠብቁ");
+    toast(msg);
   }
   await renderHome(document.getElementById("view"));
 }
@@ -982,6 +1141,7 @@ async function openDirectLinkAd(){
     if (btn){ btn.disabled = true; btn.textContent = "Claiming…"; }
     try {
       const r = await api("/api/ads/direct-link/claim", { event_id: res.event_id });
+      celebrateBurst();
       tg?.HapticFeedback?.notificationOccurred("success");
       toast(`✅ +${fmt(r.credited)} Birr credited`);
     } catch (claimErr) {
@@ -1044,18 +1204,31 @@ async function renderTasks(view){
   function paint(){
     list.innerHTML = data.tasks.map(t => taskCardHTML(t)).join("");
   }
+  // Updates a single task's card in place — used everywhere after the
+  // initial paint() so a change to one task never re-renders (and
+  // flickers) every other task card in the list.
+  function paintOne(id){
+    const t = data.tasks.find(x => x.id === id);
+    const el = document.getElementById(`task-${id}`);
+    if (!t || !el) return;
+    // Update content/class on the *same* node (not outerHTML) so this
+    // card doesn't get re-inserted into the DOM every tick — a fresh
+    // node re-triggers the .cascade fade-in animation on every child,
+    // which is what caused the whole list to "pop"/flicker once a
+    // second while a countdown was running.
+    el.className = `task ${t.status === 'completed' ? 'completed' : ''}`;
+    el.innerHTML = taskCardInner(t);
+  }
   paint();
 
   taskTimer = setInterval(() => {
-    let dirty = false;
     data.tasks.forEach(t => {
       if (t.status === "waiting" && t.wait_left > 0){
         t.wait_left -= 1;
         if (t.wait_left <= 0){ t.status = "claimable"; t.uiStage = "check"; }
-        dirty = true;
+        paintOne(t.id);
       }
     });
-    if (dirty) paint();
   }, 1000);
 
   window._taskAction = async (id, action) => {
@@ -1068,7 +1241,7 @@ async function renderTasks(view){
         const r = await api("/api/tasks/join", { task_id: id });
         t.status = "waiting";
         t.wait_left = r.wait_seconds;
-        paint();
+        paintOne(id);
       } catch (e){ toast("⚠️ Couldn't start this task."); }
       return;
     }
@@ -1081,18 +1254,18 @@ async function renderTasks(view){
       // so the original wait-timer state is untouched.
       if (t.invite_link) window.open(t.invite_link, "_blank");
       t.uiStage = "check";
-      paint();
+      paintOne(id);
       return;
     }
 
     if (action === "check"){
       t.uiStage = "checking";
-      paint();
+      paintOne(id);
       tg?.HapticFeedback?.impactOccurred("light");
       try {
         await api("/api/tasks/check", { task_id: id });
         t.uiStage = "claim";
-        paint();
+        paintOne(id);
       } catch (e){
         if (e.message.startsWith("wait:")){
           t.uiStage = "check";
@@ -1107,23 +1280,24 @@ async function renderTasks(view){
           t.uiStage = "check";
           toast("⚠️ Couldn't verify. Try again.");
         }
-        paint();
+        paintOne(id);
       }
       return;
     }
 
     if (action === "claim"){
       t.uiStage = "claiming";
-      paint();
+      paintOne(id);
       try {
         const r = await api("/api/tasks/claim", { task_id: id });
         if (r.status === "completed"){
           t.status = "completed";
           toast(`🎉 +${fmt(r.reward)} Birr credited!`);
           document.getElementById("topBal").textContent = `${fmt(r.balance)} Birr`;
+          celebrateBurst();
           tg?.HapticFeedback?.notificationOccurred("success");
         }
-        paint();
+        paintOne(id);
       } catch (e){
         if (e.message === "not_checked"){
           // Shouldn't normally happen through the UI (Check always runs
@@ -1135,7 +1309,7 @@ async function renderTasks(view){
           t.uiStage = "claim";
           toast("⚠️ Something went wrong. Try again.");
         }
-        paint();
+        paintOne(id);
       }
     }
   };
@@ -1369,7 +1543,7 @@ async function cancelMyTask(id){
   }
 }
 
-function taskCardHTML(t){
+function taskCardInner(t){
   // No visible tag distinguishing "fake" (no real check) from "force"
   // (real check) tasks in the user-facing list — they must look
   // identical so users can't tell which ones are unverified.
@@ -1398,13 +1572,19 @@ function taskCardHTML(t){
     btn = `<button class="task-btn join" onclick="_taskAction(${t.id},'join')">Join</button>`;
   }
   return `
-    <div class="task ${t.status === 'completed' ? 'completed' : ''}">
-      <div class="task-ic">📢</div>
-      <div class="task-body">
-        <div class="task-title">${escapeHtml(t.title)} ${typeTag}</div>
-        <div class="task-reward">+${fmt(t.reward)} Birr</div>
-      </div>
-      ${btn}
+    <div class="task-ic">📢</div>
+    <div class="task-body">
+      <div class="task-title">${escapeHtml(t.title)} ${typeTag}</div>
+      <div class="task-reward">+${fmt(t.reward)} Birr</div>
+    </div>
+    ${btn}
+  `;
+}
+
+function taskCardHTML(t){
+  return `
+    <div class="task ${t.status === 'completed' ? 'completed' : ''}" id="task-${t.id}">
+      ${taskCardInner(t)}
     </div>
   `;
 }
@@ -1448,48 +1628,21 @@ function copyLink(){
   navigator.clipboard?.writeText(el.value).catch(()=>{});
   toast("🔗 Link copied!");
 }
-async function shareLink(){
-  const btn = document.getElementById("shareLinkBtn");
-  if (btn){ btn.disabled = true; btn.innerHTML = `<span class="spin-ico"></span> Preparing…`; }
-  toast("Preparing your invite link…", "loading", { sticky: true });
-
-  try {
-    // The send itself is fast — awaited here (not fire-and-forget) so we
-    // can show a real success state before minimizing the Mini App.
-    await api("/api/invite/share_card", {});
-    toast("✅ Sent to your chat!");
-    if (btn){ btn.innerHTML = "✅ Sent!"; }
-    if (tg?.close){
-      // Brief pause so the success toast is actually visible before the
-      // Mini App minimizes and the person lands back in their chat.
-      setTimeout(() => tg.close(), 550);
-      return;
-    }
-  } catch (e) {
-    if (e.message?.startsWith("cooldown:")){
-      const mins = Math.ceil(parseInt(e.message.split(":")[1], 10) / 60);
-      toast(`💬 You can resend it in your bot chat in ~${mins} min`);
-    } else {
-      toast("⚠️ Couldn't send — try again");
-    }
-  }
-
-  // Outside Telegram (e.g. desktop browser preview), or on cooldown —
-  // fall back to Telegram's native chat picker or a plain share link.
-  if (tg?.switchInlineQuery){
-    tg.switchInlineQuery("invite", ["users", "groups", "channels"]);
-  } else {
-    const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
-               + "✅ Complete simple tasks\n"
-               + "✅ Watch short ads\n"
-               + "✅ Invite friends for bonus rewards\n"
-               + "✅ Withdraw straight to Telebirr\n\n"
-               + "Join now 👇";
-    const shareUrl = `https://t.me/share/url?url=${encodeURIComponent(ME.referral_link)}&text=${encodeURIComponent(text)}`;
-    window.open(shareUrl, "_blank");
-  }
-
-  if (btn){ btn.disabled = false; btn.innerHTML = "📤 Share with Friends"; }
+function shareLink(){
+  // Plain text share via Telegram's native "send to" picker — no inline
+  // keyboard, no dependency on inline mode being enabled in BotFather.
+  // The link is embedded directly in the text (not passed as a separate
+  // `url` param) — otherwise Telegram prepends the link before the text
+  // instead of after it.
+  const text = "🎉 I'm earning real money with this bot — and you can too!\n\n"
+             + "✅ Complete simple tasks\n"
+             + "✅ Watch short ads\n"
+             + "✅ Invite friends for bonus rewards\n"
+             + "✅ Withdraw straight to Telebirr\n\n"
+             + "Join now 👇\n"
+             + ME.referral_link;
+  const shareUrl = `https://t.me/share/url?url=&text=${encodeURIComponent(text)}`;
+  tg?.openTelegramLink ? tg.openTelegramLink(shareUrl) : window.open(shareUrl, "_blank");
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1502,10 +1655,16 @@ async function renderWithdraw(view){
     <div class="cascade">
     <h2 class="sect" style="margin-top:0">Request Withdrawal</h2>
     <div class="card">
-      <label class="f">Amount (Birr) — min ${fmt(ME.min_withdrawal)}</label>
-      <input type="number" id="wAmount" placeholder="e.g. ${fmt(ME.min_withdrawal)}">
-      <label class="f">Telebirr Phone Number</label>
-      <input type="text" id="wPhone" placeholder="09xxxxxxxx">
+      <label class="f">Withdrawal Method</label>
+      <select id="wMethod" onchange="onWithdrawMethodChange()">
+        <option value="telebirr">📲 Telebirr</option>
+        <option value="binance">💳 Binance (USDT)</option>
+      </select>
+      <label class="f" id="wAmountLabel">Amount (Birr) — min ${fmt(ME.min_withdrawal)}</label>
+      <input type="number" id="wAmount" placeholder="e.g. ${fmt(ME.min_withdrawal)}" oninput="updateWithdrawUsdtPreview()">
+      <div class="mini" id="wUsdtPreview" style="display:none;margin-top:-6px;margin-bottom:10px"></div>
+      <label class="f" id="wIdentifierLabel">Telebirr Phone Number</label>
+      <input type="text" id="wIdentifier" placeholder="09xxxxxxxx">
       <label class="f">Full Name</label>
       <input type="text" id="wName" placeholder="Account holder name">
       <button class="btn gold" id="wSubmitBtn" onclick="submitWithdraw()">💸 Submit Request</button>
@@ -1516,7 +1675,7 @@ async function renderWithdraw(view){
         <div class="list-item">
           <div>
             <div style="font-weight:700;font-size:.82rem">${fmt(w.amount)} Birr</div>
-            <div class="mini">${w.created_at}</div>
+            <div class="mini">${w.created_at} · ${w.method === 'binance' ? '💳 Binance' : '📲 Telebirr'}</div>
           </div>
           <span class="pill-tag ${w.status === 'approved' ? 'fake' : w.status === 'rejected' ? 'force' : ''}"
                 style="background:${w.status==='pending'?'rgba(58,123,213,.15)':''};color:${w.status==='pending'?'#7fa8ff':''}">
@@ -1528,22 +1687,59 @@ async function renderWithdraw(view){
     </div>
   `;
 }
-async function submitWithdraw(){
+function onWithdrawMethodChange(){
+  const method = document.getElementById("wMethod").value;
+  const isBinance = method === "binance";
+  const minW = isBinance ? (ME.min_withdrawal_binance ?? ME.min_withdrawal) : ME.min_withdrawal;
+  document.getElementById("wAmountLabel").textContent = `Amount (Birr) — min ${fmt(minW)}`;
+  document.getElementById("wAmount").placeholder = `e.g. ${fmt(minW)}`;
+  document.getElementById("wIdentifierLabel").textContent = isBinance ? "Binance ID" : "Telebirr Phone Number";
+  document.getElementById("wIdentifier").placeholder = isBinance ? "e.g. 123456789" : "09xxxxxxxx";
+  updateWithdrawUsdtPreview();
+}
+function updateWithdrawUsdtPreview(){
+  const preview = document.getElementById("wUsdtPreview");
+  const method = document.getElementById("wMethod")?.value;
+  if (method !== "binance"){
+    preview.style.display = "none";
+    return;
+  }
   const amount = parseFloat(document.getElementById("wAmount").value);
-  const phone  = document.getElementById("wPhone").value.trim();
-  const name   = document.getElementById("wName").value.trim();
-  if (!amount || amount < ME.min_withdrawal) return toast(`❌ Min ${fmt(ME.min_withdrawal)} Birr`);
-  if (phone.length < 9) return toast("❌ Enter a valid phone number");
+  const rate = ME.usdt_to_birr_rate || 130;
+  if (!amount || amount <= 0 || !rate){
+    preview.style.display = "none";
+    return;
+  }
+  preview.style.display = "block";
+  preview.textContent = `≈ ${(amount / rate).toFixed(4)} USDT (rate: 1 USDT = ${fmt(rate)} Birr)`;
+}
+async function submitWithdraw(){
+  const method     = document.getElementById("wMethod").value;
+  const amount     = parseFloat(document.getElementById("wAmount").value);
+  const identifier = document.getElementById("wIdentifier").value.trim();
+  const name       = document.getElementById("wName").value.trim();
+  const isBinance  = method === "binance";
+  const minW = isBinance ? (ME.min_withdrawal_binance ?? ME.min_withdrawal) : ME.min_withdrawal;
+
+  if (!amount || amount < minW) return toast(`❌ Min ${fmt(minW)} Birr`);
+  if (isBinance){
+    if (identifier.length < 4) return toast("❌ Enter a valid Binance ID");
+  } else {
+    if (identifier.length < 9) return toast("❌ Enter a valid phone number");
+  }
   if (name.length < 3) return toast("❌ Enter your full name");
 
   const btn = document.getElementById("wSubmitBtn");
   const card = btn.closest(".card");
   btn.disabled = true;
   btn.innerHTML = `<span class="spin-ico"></span> Submitting…`;
-  card.querySelectorAll("input").forEach(i => i.disabled = true);
+  card.querySelectorAll("input,select").forEach(i => i.disabled = true);
 
   try {
-    await api("/api/withdraw", { amount, phone, full_name: name });
+    const payload = { amount, full_name: name, method };
+    if (isBinance) payload.binance_id = identifier;
+    else payload.phone = identifier;
+    await api("/api/withdraw", payload);
     tg?.HapticFeedback?.notificationOccurred("success");
     card.innerHTML = `
       <div style="text-align:center;padding:6px 0 4px;animation:fadeSlideUp .35s ease">
@@ -1558,7 +1754,7 @@ async function submitWithdraw(){
     toast("❌ " + (e.message || "Failed"));
     btn.disabled = false;
     btn.innerHTML = "💸 Submit Request";
-    card.querySelectorAll("input").forEach(i => i.disabled = false);
+    card.querySelectorAll("input,select").forEach(i => i.disabled = false);
   }
 }
 
@@ -1798,7 +1994,7 @@ async function adminWithdrawals(body){
         <div class="list-item">
           <div>
             <div style="font-weight:700;font-size:.82rem">${fmt(w.amount)} Birr — ${escapeHtml(w.full_name)}</div>
-            <div class="mini">UID ${w.user_id} · ${escapeHtml(w.phone)}</div>
+            <div class="mini">UID ${w.user_id} · ${w.method === 'binance' ? '💳 Binance: ' : '📲 '}${escapeHtml(w.phone)}</div>
           </div>
           <div style="display:flex;gap:5px;flex-shrink:0">
             <button class="btn sm ghost" style="width:auto;background:rgba(200,242,77,.15);color:var(--lime)" onclick="approveWd(${w.id},'both')" title="Approve — notify user + channel">✓ Both</button>
@@ -1916,15 +2112,31 @@ async function adminAds(body){
 
 /* ── Admin: Settings ──────────────────────────────────────────── */
 async function adminSettings(body){
-  const s = await api("/api/admin/settings");
+  let s;
+  try {
+    s = await api("/api/admin/settings");
+  } catch (e) {
+    body.innerHTML = `<div class="empty">Couldn't load settings. ${escapeHtml(e?.message || "")}</div>`;
+    return;
+  }
   body.innerHTML = `
     <div class="card">
       <label class="f">Reward per Referral (Birr)</label>
-      <input id="stReward" type="number" value="${s.reward_per_referral}">
+      <input id="stReward" type="number" value="${s.reward_per_referral ?? 10}">
       <label class="f">Minimum Withdrawal (Birr)</label>
-      <input id="stMinWd" type="number" value="${s.min_withdrawal}">
+      <input id="stMinWd" type="number" value="${s.min_withdrawal ?? 50}">
+      <label class="f">Minimum Ads Required for Withdrawal (0 to disable)</label>
+      <input id="stMinAdsWd" type="number" value="${s.min_ads_for_withdrawal ?? 30}">
       <label class="f">👨‍🔧 Support Telegram Username</label>
       <input id="stSupportUser" type="text" placeholder="e.g. hf_support (no @)" value="${escapeHtml(s.support_username || '')}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
+    <h2 class="sect">Binance Withdrawal</h2>
+    <div class="card">
+      <label class="f">Minimum Withdrawal for Binance (Birr)</label>
+      <input id="stMinWdBinance" type="number" value="${s.min_withdrawal_binance ?? 50}">
+      <label class="f">USDT Rate — 1 USDT = ? Birr</label>
+      <input id="stUsdtRate" type="number" step="0.01" value="${s.usdt_to_birr_rate ?? 130}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
     <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;">
@@ -1997,24 +2209,7 @@ async function adminSettings(body){
       <input id="stRefSkipMax" type="number" min="0" value="${s.referral_skip_max}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
-    
-      <h2 class="sect">Live Payout Ticker Settings</h2>
-      <div class="card">
-        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px;">
-          <div style="font-weight:700;font-size:.88rem">Enable Live Ticker</div>
-          <input type="checkbox" id="stTickerEnabled" style="width:20px;height:20px;margin:0;" ${s.ticker_enabled ? "checked" : ""}>
-        </div>
-        <label class="f">Add Custom Name & Amount</label>
-        <div style="display:flex;gap:8px;margin-bottom:12px;">
-          <input id="stCustomName" placeholder="Name (e.g. Ekram)" style="flex:1;margin-bottom:0;">
-          <input id="stCustomAmount" type="number" placeholder="Amount" style="width:90px;margin-bottom:0;">
-          <button class="btn sm gold" type="button" style="width:auto;padding:10px 14px;" onclick="addCustomTickerName()">Add</button>
-        </div>
-        <div id="customNamesList" style="font-size:0.8rem;margin-top:8px;"></div>
-      </div>
-      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
-
-      <h2 class="sect">User Self-Serve Tasks (promote own channel)</h2>
+    <h2 class="sect">User Self-Serve Tasks (promote own channel)</h2>
     <div class="card">
       <div class="mini" style="margin-bottom:10px">
         Lets any user pay from their own balance to advertise their own
@@ -2036,45 +2231,113 @@ async function adminSettings(body){
       <input id="stUtcMaxSlots" type="number" value="${s.user_task_max_slots}">
       <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
     </div>
+    <h2 class="sect">Ad Reward Skip Reminder</h2>
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        Controls the "odd/even" ad-reward pattern (1st, 3rd, 5th... view
+        doesn't pay; 2nd, 4th, 6th... does) and the message shown when a
+        view isn't confirmed. When Skip Mechanism is Off, every view is
+        genuinely a delivery issue when unconfirmed, so Network Error Text
+        is always shown instead. When On, the Show dropdown picks between
+        Reminder Text and Disguise Text.
+      </div>
+      <label class="f">Skip Mechanism</label>
+      <select id="stAdReminderEnabled">
+        <option value="0" ${!s.ad_click_reminder_enabled ? "selected" : ""}>Off — pay every ad view</option>
+        <option value="1" ${s.ad_click_reminder_enabled ? "selected" : ""}>On — alternate odd/even</option>
+      </select>
+      <label class="f">Show (when Skip Mechanism is On)</label>
+      <select id="stAdReminderDisguised">
+        <option value="0" ${!s.ad_click_reminder_disguised ? "selected" : ""}>Reminder Text</option>
+        <option value="1" ${s.ad_click_reminder_disguised ? "selected" : ""}>Disguise Text</option>
+      </select>
+      <label class="f">Reminder Text</label>
+      <input id="stAdReminderText" type="text" value="${escapeHtml(s.ad_click_reminder_text || '')}">
+      <label class="f">Disguise Text</label>
+      <input id="stAdReminderDisguiseText" type="text" value="${escapeHtml(s.ad_click_reminder_disguise_text || '')}">
+      <label class="f">Network Error Text (shown when Skip Mechanism is Off)</label>
+      <input id="stAdReminderNetworkText" type="text" value="${escapeHtml(s.ad_click_reminder_network_text || '')}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
+    <h2 class="sect">Daily Check-in</h2>
+    <div class="card">
+      <div class="mini" style="margin-bottom:10px">
+        Once-a-day bonus: user watches one ad, then claims a fixed reward.
+        Streak count increases on consecutive days.
+      </div>
+      <label class="f">Enabled</label>
+      <select id="stDailyCheckEnabled">
+        <option value="0" ${!s.daily_checkin_enabled ? "selected" : ""}>Off</option>
+        <option value="1" ${s.daily_checkin_enabled ? "selected" : ""}>On</option>
+      </select>
+      <label class="f">Reward per Check-in (Birr)</label>
+      <input id="stDailyCheckReward" type="number" step="0.1" value="${s.daily_checkin_reward}">
+      <label class="f">"Couldn't Confirm" Message</label>
+      <input id="stDailyCheckReminderText" type="text" value="${escapeHtml(s.daily_checkin_reminder_text || '')}">
+      <button class="btn gold" onclick="saveSettings()">💾 Save Settings</button>
+    </div>
   `;
 }
+function _num(id, fallback, isInt){
+  const raw = document.getElementById(id).value;
+  const v = isInt ? parseInt(raw, 10) : parseFloat(raw);
+  return Number.isFinite(v) ? v : fallback;
+}
 async function saveSettings(){
-  const reward_per_referral = parseFloat(document.getElementById("stReward").value);
-  const min_withdrawal = parseFloat(document.getElementById("stMinWd").value);
+  const reward_per_referral = _num("stReward", 10, false);
+  const min_withdrawal = _num("stMinWd", 50, false);
+  const min_withdrawal_binance = _num("stMinWdBinance", 50, false);
+  const usdt_to_birr_rate = _num("stUsdtRate", 130, false);
+  const min_ads_for_withdrawal = _num("stMinAdsWd", 30, true);
   const support_username = document.getElementById("stSupportUser").value.trim().replace(/^@/, "");
   const ads_enabled = document.getElementById("stAdsEnabled").value === "1";
   const adsgram_block_id = document.getElementById("stAdBlock").value.trim();
-  const ad_reward_amount = parseFloat(document.getElementById("stAdReward").value);
-  const ad_daily_limit = parseInt(document.getElementById("stAdDaily").value, 10);
-  const ad_cooldown_seconds = parseInt(document.getElementById("stAdCooldown").value, 10);
+  const ad_reward_amount = _num("stAdReward", 0.5, false);
+  const ad_daily_limit = _num("stAdDaily", 10, true);
+  const ad_cooldown_seconds = _num("stAdCooldown", 30, true);
   const adsgram_direct_link = document.getElementById("stAdDirectLink").value.trim();
-  const direct_link_reward_amount = parseFloat(document.getElementById("stAdDlReward").value);
-  const direct_link_daily_limit = parseInt(document.getElementById("stAdDlDaily").value, 10);
-  const direct_link_wait_seconds = parseInt(document.getElementById("stAdDlWait").value, 10);
-  const direct_link_cooldown_seconds = parseInt(document.getElementById("stAdDlCooldown").value, 10);
+  const direct_link_reward_amount = _num("stAdDlReward", 0.3, false);
+  const direct_link_daily_limit = _num("stAdDlDaily", 10, true);
+  const direct_link_wait_seconds = _num("stAdDlWait", 15, true);
+  const direct_link_cooldown_seconds = _num("stAdDlCooldown", 30, true);
   const monetag_sdk_url = document.getElementById("stMonetagUrl").value.trim();
   const monetag_zone_id = document.getElementById("stMonetagZone").value.trim();
   const referral_skip_enabled = document.getElementById("stRefSkipEnabled").value === "1";
-  const referral_skip_batch_size = parseInt(document.getElementById("stRefSkipBatch").value, 10);
-  const referral_skip_min = parseInt(document.getElementById("stRefSkipMin").value, 10);
-  const referral_skip_max = parseInt(document.getElementById("stRefSkipMax").value, 10);
+  const referral_skip_batch_size = _num("stRefSkipBatch", 6, true);
+  const referral_skip_min = _num("stRefSkipMin", 1, true);
+  const referral_skip_max = _num("stRefSkipMax", 3, true);
   const user_task_creation_enabled = document.getElementById("stUtcEnabled").value === "1";
-  const user_task_min_reward = parseFloat(document.getElementById("stUtcMinReward").value);
-  const user_task_max_reward = parseFloat(document.getElementById("stUtcMaxReward").value);
-  const user_task_min_slots = parseInt(document.getElementById("stUtcMinSlots").value, 10);
-  const user_task_max_slots = parseInt(document.getElementById("stUtcMaxSlots").value, 10);
-  await api("/api/admin/settings/update", {
-    reward_per_referral, min_withdrawal, support_username,
-    ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
-    adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
-    direct_link_wait_seconds, direct_link_cooldown_seconds,
-    monetag_sdk_url, monetag_zone_id,
-    referral_skip_enabled, referral_skip_batch_size, referral_skip_min, referral_skip_max,
-    user_task_creation_enabled, user_task_min_reward, user_task_max_reward,
-    user_task_min_slots, user_task_max_slots,
-  });
-  toast("✅ Settings saved");
-  refreshMe();
+  const user_task_min_reward = _num("stUtcMinReward", 1, false);
+  const user_task_max_reward = _num("stUtcMaxReward", 20, false);
+  const user_task_min_slots = _num("stUtcMinSlots", 5, true);
+  const user_task_max_slots = _num("stUtcMaxSlots", 500, true);
+  const ad_click_reminder_enabled = document.getElementById("stAdReminderEnabled").value === "1";
+  const ad_click_reminder_disguised = document.getElementById("stAdReminderDisguised").value === "1";
+  const ad_click_reminder_text = document.getElementById("stAdReminderText").value.trim();
+  const ad_click_reminder_disguise_text = document.getElementById("stAdReminderDisguiseText").value.trim();
+  const ad_click_reminder_network_text = document.getElementById("stAdReminderNetworkText").value.trim();
+  const daily_checkin_enabled = document.getElementById("stDailyCheckEnabled").value === "1";
+  const daily_checkin_reward = _num("stDailyCheckReward", 5, false);
+  const daily_checkin_reminder_text = document.getElementById("stDailyCheckReminderText").value.trim();
+  try {
+    await api("/api/admin/settings/update", {
+      reward_per_referral, min_withdrawal, min_withdrawal_binance, usdt_to_birr_rate, min_ads_for_withdrawal, support_username,
+      ads_enabled, adsgram_block_id, ad_reward_amount, ad_daily_limit, ad_cooldown_seconds,
+      adsgram_direct_link, direct_link_reward_amount, direct_link_daily_limit,
+      direct_link_wait_seconds, direct_link_cooldown_seconds,
+      monetag_sdk_url, monetag_zone_id,
+      referral_skip_enabled, referral_skip_batch_size, referral_skip_min, referral_skip_max,
+      user_task_creation_enabled, user_task_min_reward, user_task_max_reward,
+      user_task_min_slots, user_task_max_slots,
+      ad_click_reminder_enabled, ad_click_reminder_disguised,
+      ad_click_reminder_text, ad_click_reminder_disguise_text, ad_click_reminder_network_text,
+      daily_checkin_enabled, daily_checkin_reward, daily_checkin_reminder_text,
+    });
+    toast("✅ Settings saved");
+    refreshMe();
+  } catch (e) {
+    toast(`❌ Save failed: ${e?.message || "unknown error"}`);
+  }
 }
 async function checkAdsgramConnection(){
   const box = document.getElementById("adsgramCheckResult");
@@ -2244,83 +2507,3 @@ async function recheckGate(){
 </script>
 </body>
 </html>
-
-<script>
-
-async function loadPayoutTicker() {
-  try {
-    const res = await api("/api/withdrawals/recent");
-    const wrap = document.getElementById("payoutTicker");
-    const track = document.getElementById("tickerTrack");
-    if (!wrap || !track) return;
-
-    if (!res || !res.enabled) {
-      wrap.style.display = "none";
-      return;
-    }
-
-    const list = res.withdrawals || [];
-    // Requirement: only scroll if at least 10 entries exist
-    if (list.length < 10) {
-      wrap.style.display = "none";
-      return;
-    }
-
-    let html = "";
-    list.forEach(w => {
-      const name = w.full_name || w.name || "User";
-      const amt = Number(w.amount || 0).toFixed(2);
-      const statusText = w.status === "approved" ? "✅ Received" : "⏳ Requested";
-      html += `<span class="ticker-item">🎉 <b>${name}</b> ${statusText} <b>${amt} Birr</b></span>`;
-    });
-    track.innerHTML = html + html;
-    wrap.style.display = "flex";
-  } catch (e) {
-    // silent fail
-  }
-}
-
-setTimeout(loadPayoutTicker, 500);
-</script>
-
-<script>
-
-let customTickerNamesList = [];
-
-function renderCustomTickerNames() {
-  const box = document.getElementById("customNamesList");
-  if (!box) return;
-  if (customTickerNamesList.length === 0) {
-    box.innerHTML = `<span style="color:var(--ink-faint)">No custom names added yet. Default Ethiopian names will be used.</span>`;
-    return;
-  }
-  let h = "";
-  customTickerNamesList.forEach((item, idx) => {
-    h += `<div style="display:flex;align-items:center;justify-content:space-between;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05)">`
-      + `<span>👤 <b>${item.full_name}</b> - ${item.amount} Birr</span>`
-      + `<button type="button" class="btn sm danger" style="width:auto;padding:2px 8px;" onclick="removeCustomTickerName(${idx})">🗑</button>`
-      + `</div>`;
-  });
-  box.innerHTML = h;
-}
-
-function addCustomTickerName() {
-  const name = document.getElementById("stCustomName")?.value?.trim();
-  const amt = parseFloat(document.getElementById("stCustomAmount")?.value || "0");
-  if (!name || amt <= 0) {
-    toast("⚠️ Please enter valid name and amount");
-    return;
-  }
-  customTickerNamesList.push({ full_name: name, amount: amt, status: "approved" });
-  document.getElementById("stCustomName").value = "";
-  document.getElementById("stCustomAmount").value = "";
-  renderCustomTickerNames();
-  toast("✅ Added to list. Click 'Save Settings' to apply.");
-}
-
-function removeCustomTickerName(idx) {
-  customTickerNamesList.splice(idx, 1);
-  renderCustomTickerNames();
-}
-
-</script>
